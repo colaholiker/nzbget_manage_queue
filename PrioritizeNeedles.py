@@ -27,7 +27,10 @@
 #
 # Use this for longer lists. Blank lines and lines starting with '#' are
 # ignored. Needles from NeedleList and NeedleFile are combined.
-# Example: /config/needles.txt
+#
+# A relative path is resolved against MainDir. NZBGet directory tokens are
+# supported: ${MainDir}, ${ScriptDir}, ${ConfigDir}, ${DestDir}, ${NzbDir}, ...
+# Examples: needles.txt   ${ScriptDir}/needles.txt   /config/needles.txt
 #NeedleFile=
 
 # Priority to assign on a match.
@@ -92,6 +95,40 @@ def parse_needles(raw):
     return [n.strip() for n in raw.split(",") if n.strip()]
 
 
+def resolve_path(path):
+    """Resolve a NeedleFile path.
+
+    Supports NZBGet directory tokens (${MainDir}, ${ScriptDir}, ${ConfigDir},
+    ${DestDir}, ...) and normal environment variables. A relative path is
+    resolved against MainDir.
+    """
+    if not path:
+        return path
+
+    tokens = {
+        "MainDir": os.environ.get("NZBOP_MAINDIR", ""),
+        "DestDir": os.environ.get("NZBOP_DESTDIR", ""),
+        "InterDir": os.environ.get("NZBOP_INTERDIR", ""),
+        "NzbDir": os.environ.get("NZBOP_NZBDIR", ""),
+        "QueueDir": os.environ.get("NZBOP_QUEUEDIR", ""),
+        "TempDir": os.environ.get("NZBOP_TEMPDIR", ""),
+        "ScriptDir": os.environ.get("NZBOP_SCRIPTDIR", ""),
+        # NZBGet exposes the config file, not its directory.
+        "ConfigDir": os.path.dirname(os.environ.get("NZBOP_CONFIGFILE", "")),
+    }
+    for name, value in tokens.items():
+        if value:
+            path = path.replace("${%s}" % name, value)
+
+    path = os.path.expanduser(os.path.expandvars(path))
+
+    # Relative paths are taken relative to MainDir (fall back to CWD).
+    if not os.path.isabs(path) and tokens["MainDir"]:
+        path = os.path.join(tokens["MainDir"], path)
+
+    return os.path.normpath(path)
+
+
 def read_needle_file(path):
     """Read needles from a file, one per line.
 
@@ -99,18 +136,19 @@ def read_needle_file(path):
     """
     if not path:
         return []
-    if not os.path.isfile(path):
-        log_warning("NeedleFile '%s' not found - ignoring." % path)
+    resolved = resolve_path(path)
+    if not os.path.isfile(resolved):
+        log_warning("NeedleFile not found: '%s' (from '%s') - ignoring." % (resolved, path))
         return []
     needles = []
     try:
-        with open(path, "r", encoding="utf-8") as handle:
+        with open(resolved, "r", encoding="utf-8") as handle:
             for line in handle:
                 stripped = line.strip()
                 if stripped and not stripped.startswith("#"):
                     needles.append(stripped)
     except OSError as exc:
-        log_warning("Could not read NeedleFile '%s': %s" % (path, exc))
+        log_warning("Could not read NeedleFile '%s': %s" % (resolved, exc))
     return needles
 
 

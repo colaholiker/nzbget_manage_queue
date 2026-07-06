@@ -48,6 +48,13 @@ NZBGet's option fields are single-line, so for a longer list of needles use
 lines starting with `#` are ignored. Needles from `NeedleList` and `NeedleFile`
 are combined.
 
+The path can be absolute (`/config/needles.txt`) or relative — a **relative
+path is resolved against MainDir**. NZBGet directory tokens also work:
+`${MainDir}`, `${ScriptDir}`, `${ConfigDir}`, `${DestDir}`, `${NzbDir}`, …
+For example `${ScriptDir}/needles.txt` keeps the list next to the script.
+If the file is missing, the script logs the resolved path it tried and
+continues without those needles.
+
 ```
 # /config/needles.txt
 1080p
