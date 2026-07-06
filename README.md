@@ -36,8 +36,12 @@ Requirements: NZBGet 13.0 or later and Python 3.
 | `NeedleFile`    | Path to a file with one needle per line (for longer lists)   | *(empty)*   |
 | `MatchPriority` | Priority to assign on a match                                | `100`       |
 | `MatchMode`     | `substring` (plain text) or `regex` (Python regular expr.)   | `substring` |
-| `CaseSensitive` | Match case sensitively (`yes` / `no`)                        | `no`        |
 | `MoveToTop`     | Move matched downloads to the top of the queue (`yes` / `no`)| `no`        |
+
+Matching **ignores case, spaces and dots** on both sides, so the needle
+`some movie` matches the name `Some.Movie.1080p`. In `regex` mode the pattern is
+applied to the already-normalized name (no spaces or dots), so avoid matching
+those characters explicitly.
 
 NZBGet's option fields are single-line, so for a longer list of needles use
 `NeedleFile` — a plain text file with **one needle per line**. Blank lines and

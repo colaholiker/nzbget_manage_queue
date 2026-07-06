@@ -41,10 +41,10 @@
 #
 #  substring - the needle is a plain text fragment (default);
 #  regex     - the needle is a Python regular expression.
+#
+# Matching always ignores case, spaces and dots on both sides, so the needle
+# "some movie" matches the name "Some.Movie.1080p".
 #MatchMode=substring
-
-# Match case sensitively (yes, no).
-#CaseSensitive=no
 
 # Move matched downloads to the top of the queue (yes, no).
 #MoveToTop=no
@@ -114,20 +114,26 @@ def read_needle_file(path):
     return needles
 
 
-def name_matches(nzb_name, needles, mode, case_sensitive):
-    """Return the first needle that matches, or None."""
-    haystack = nzb_name if case_sensitive else nzb_name.lower()
+def normalize(text):
+    """Lower-case and drop spaces and dots so separators don't matter."""
+    return re.sub(r"[\s.]+", "", text).lower()
+
+
+def name_matches(nzb_name, needles, mode):
+    """Return the first needle that matches, or None.
+
+    Matching ignores case, spaces and dots on both sides.
+    """
+    haystack = normalize(nzb_name)
     for needle in needles:
         if mode == "regex":
-            flags = 0 if case_sensitive else re.IGNORECASE
             try:
-                if re.search(needle, nzb_name, flags):
+                if re.search(needle, haystack, re.IGNORECASE):
                     return needle
             except re.error as exc:
                 log_warning("Skipping invalid regex needle '%s': %s" % (needle, exc))
         else:  # substring
-            candidate = needle if case_sensitive else needle.lower()
-            if candidate in haystack:
+            if normalize(needle) in haystack:
                 return needle
     return None
 
@@ -155,9 +161,7 @@ def main():
         log_warning("Unknown MatchMode '%s', falling back to 'substring'." % mode)
         mode = "substring"
 
-    case_sensitive = get_bool_option("CaseSensitive", False)
-
-    matched = name_matches(nzb_name, needles, mode, case_sensitive)
+    matched = name_matches(nzb_name, needles, mode)
     if matched is None:
         log_detail("No needle matched '%s'." % nzb_name)
         return SUCCESS
