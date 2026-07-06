@@ -45,7 +45,6 @@ Requirements: NZBGet 13.0 or later and Python 3.
 | `MoveToTop`     | Move matched downloads to the top of the queue (`yes` / `no`)| `no`        |
 | `ApplyToQueue`  | Also re-prioritize nzbs already in the queue (`yes` / `no`)   | `no`        |
 | `QueueEvents`   | Queue events to react to (comma-separated)                   | `NZB_ADDED, URL_COMPLETED` |
-| `QueueSort`     | Sort the queue after priority changes                        | `priority:desc, age:asc, title:asc` |
 
 Matching **ignores case, spaces and dots** on both sides, so the needle
 `some movie` matches the name `Some.Movie.1080p`. In `regex` mode the pattern is
@@ -102,12 +101,6 @@ When enabled as a **queue script**, the extension reacts to the events listed in
 For the configured events only the **triggering nzb** is re-prioritized. If
 `ApplyToQueue` is also enabled, the **whole queue** is re-checked on each of
 those events instead.
-
-After the priority updates, the queue is re-sorted with `QueueSort`. The
-default order is `priority:desc, age:asc, title:asc`, which keeps higher
-priority items first, then older items, then alphabetical titles. Set
-`QueueSort=` to disable sorting or change the field order/direction to fit
-your workflow.
 
 Enable it as a queue script under **Settings → EXTENSION SCRIPTS → QueueScript**
 (or add it to the extension's `Queue` phase in newer versions).
