@@ -253,7 +253,7 @@ def apply_to_queue(needles, mode, priority, move_to_top):
             continue
         try:
             editqueue("GroupSetPriority", priority, [nzbid])
-            if move_to_top:
+            if move_to_top and needle is not None:
                 editqueue("GroupMoveTop", 0, [nzbid])
         except Exception as exc:  # noqa: BLE001
             log_warning("Could not update queue entry '%s': %s" % (name, exc))
@@ -291,7 +291,7 @@ def prioritize_nzbid(name, nzbid, needle, priority, move_to_top):
     """Set the priority of a single queued nzb via RPC."""
     log_info("Queue: '%s' matched needle '%s' - priority set to %s." % (name, needle, priority))
     editqueue("GroupSetPriority", priority, [nzbid])
-    if move_to_top:
+    if move_to_top and needle is not None:
         editqueue("GroupMoveTop", 0, [nzbid])
 
 
