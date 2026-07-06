@@ -33,10 +33,24 @@ Requirements: NZBGet 13.0 or later and Python 3.
 | Option          | Description                                                  | Default     |
 |-----------------|--------------------------------------------------------------|-------------|
 | `NeedleList`    | Comma-separated needles, e.g. `1080p, ubuntu, -PROPER-`      | *(empty)*   |
+| `NeedleFile`    | Path to a file with one needle per line (for longer lists)   | *(empty)*   |
 | `MatchPriority` | Priority to assign on a match                                | `100`       |
 | `MatchMode`     | `substring` (plain text) or `regex` (Python regular expr.)   | `substring` |
 | `CaseSensitive` | Match case sensitively (`yes` / `no`)                        | `no`        |
 | `MoveToTop`     | Move matched downloads to the top of the queue (`yes` / `no`)| `no`        |
+
+NZBGet's option fields are single-line, so for a longer list of needles use
+`NeedleFile` — a plain text file with **one needle per line**. Blank lines and
+lines starting with `#` are ignored. Needles from `NeedleList` and `NeedleFile`
+are combined.
+
+```
+# /config/needles.txt
+1080p
+ubuntu
+-PROPER-
+S\d+E\d+
+```
 
 ### Priority values
 

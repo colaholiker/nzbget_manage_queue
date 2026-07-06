@@ -20,7 +20,15 @@
 #
 # Downloads whose name contains any of these needles are prioritized.
 # Example: 1080p, ubuntu, -PROPER-
+# For longer lists use NeedleFile instead (or in addition).
 #NeedleList=
+
+# Path to a file with needles, one per line.
+#
+# Use this for longer lists. Blank lines and lines starting with '#' are
+# ignored. Needles from NeedleList and NeedleFile are combined.
+# Example: /config/needles.txt
+#NeedleFile=
 
 # Priority to assign on a match.
 #
@@ -84,6 +92,28 @@ def parse_needles(raw):
     return [n.strip() for n in raw.split(",") if n.strip()]
 
 
+def read_needle_file(path):
+    """Read needles from a file, one per line.
+
+    Blank lines and lines starting with '#' are ignored.
+    """
+    if not path:
+        return []
+    if not os.path.isfile(path):
+        log_warning("NeedleFile '%s' not found - ignoring." % path)
+        return []
+    needles = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    needles.append(stripped)
+    except OSError as exc:
+        log_warning("Could not read NeedleFile '%s': %s" % (path, exc))
+    return needles
+
+
 def name_matches(nzb_name, needles, mode, case_sensitive):
     """Return the first needle that matches, or None."""
     haystack = nzb_name if case_sensitive else nzb_name.lower()
@@ -115,8 +145,9 @@ def main():
     nzb_name = os.environ["NZBNP_NZBNAME"]
 
     needles = parse_needles(get_option("NeedleList"))
+    needles.extend(read_needle_file(get_option("NeedleFile").strip()))
     if not needles:
-        log_detail("NeedleList is empty - nothing to prioritize.")
+        log_detail("No needles configured (NeedleList/NeedleFile) - nothing to prioritize.")
         return SUCCESS
 
     mode = get_option("MatchMode", "substring").strip().lower()
