@@ -1,20 +1,26 @@
 # nzbget_manage_queue
 
-A [NZBGet](https://nzbget.com) **scan script** that prioritizes downloads whose
-name contains one of a configurable list of *needles* (keywords).
+A [NZBGet](https://nzbget.com) **scan/queue script** that prioritizes downloads
+whose name contains one of a configurable list of *needles* (keywords).
 
-When a new nzb is added, its name is checked against the needle list. On a match
+When an nzb is added, its name is checked against the needle list. On a match
 the download gets a higher priority and can optionally be moved to the top of
 the queue. Everything else is left untouched.
 
 ## How it works
 
-NZBGet calls a scan script whenever a new file appears in the incoming nzb
-directory (added via the web UI, the RPC API, or dropped into the folder). The
-script receives the name in the environment variable `NZBNP_NZBNAME` and can
-change the priority by printing `[NZB] PRIORITY=<value>` to standard output.
+The script runs in two contexts:
 
-See the official [scan scripts documentation](https://nzbget.github.io/scan-scripts).
+- **Scan** — NZBGet calls it whenever a new file appears in the incoming nzb
+  directory (web UI, RPC API, or dropped into the folder). It receives the name
+  in `NZBNP_NZBNAME` and sets the priority by printing `[NZB] PRIORITY=<value>`.
+- **Queue** — NZBGet calls it on queue events (`NZBNA_EVENT`). This also covers
+  url downloads, whose final name is only known once the url has been fetched
+  (`URL_COMPLETED`). Matching entries are re-prioritized through the RPC-API.
+
+See the official
+[scan scripts](https://nzbget.github.io/scan-scripts) and
+[queue scripts](https://nzbget.github.io/queue-scripts) documentation.
 
 ## Installation
 
@@ -38,6 +44,7 @@ Requirements: NZBGet 13.0 or later and Python 3.
 | `MatchMode`     | `substring` (plain text) or `regex` (Python regular expr.)   | `substring` |
 | `MoveToTop`     | Move matched downloads to the top of the queue (`yes` / `no`)| `no`        |
 | `ApplyToQueue`  | Also re-prioritize nzbs already in the queue (`yes` / `no`)   | `no`        |
+| `QueueEvents`   | Queue events to react to (comma-separated)                   | `NZB_ADDED, URL_COMPLETED` |
 
 Matching **ignores case, spaces and dots** on both sides, so the needle
 `some movie` matches the name `Some.Movie.1080p`. In `regex` mode the pattern is
@@ -77,6 +84,27 @@ It uses the RPC connection settings NZBGet passes to the script
 configuration is needed. If the queue can't be reached, a warning is logged and
 the newly added nzb is still handled normally.
 
+### Queue events
+
+When enabled as a **queue script**, the extension reacts to the events listed in
+`QueueEvents`. Available events:
+
+| Event | When it fires | Notes |
+|-------|---------------|-------|
+| `NZB_ADDED`       | nzb added to the queue                | recommended |
+| `URL_COMPLETED`   | a url download became a real nzb      | recommended (final name known) |
+| `NZB_DOWNLOADED`  | nzb finished downloading              | priority no longer matters |
+| `FILE_DOWNLOADED` | a single file finished                | **fires very often** |
+| `NZB_DELETED`     | nzb removed from the queue            | — |
+| `NZB_MARKED`      | nzb marked (dupe/good/bad/…)          | — |
+
+For the configured events only the **triggering nzb** is re-prioritized. If
+`ApplyToQueue` is also enabled, the **whole queue** is re-checked on each of
+those events instead.
+
+Enable it as a queue script under **Settings → EXTENSION SCRIPTS → QueueScript**
+(or add it to the extension's `Queue` phase in newer versions).
+
 ### Priority values
 
 NZBGet's predefined priorities: `-100` (very low), `-50` (low), `0` (normal),
@@ -110,4 +138,18 @@ Expected output:
 [INFO] 'Ubuntu.24.04.1080p.iso.nzb' matched needle '1080p' - setting priority to 100.
 [NZB] PRIORITY=100
 [NZB] TOP=1
+```
+
+To exercise the **queue** path, set `NZBNA_*` instead of `NZBNP_*` (this talks to
+a running NZBGet via RPC, so point the control vars at your instance):
+
+```bash
+NZBOP_SCRIPTDIR=/tmp \
+NZBNA_EVENT=NZB_ADDED \
+NZBNA_NZBID=42 \
+NZBNA_NZBNAME="Ubuntu.24.04.1080p" \
+NZBPO_NEEDLELIST="1080p" \
+NZBOP_CONTROLIP=127.0.0.1 NZBOP_CONTROLPORT=6789 \
+NZBOP_CONTROLUSERNAME=nzbget NZBOP_CONTROLPASSWORD=tegbzn6789 \
+python3 PrioritizeNeedles.py
 ```

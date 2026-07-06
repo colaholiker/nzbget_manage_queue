@@ -3,15 +3,16 @@
 # Prioritize downloads whose name contains a configured needle.
 #
 ##############################################################################
-### NZBGET SCAN SCRIPT                                                     ###
+### NZBGET SCAN/QUEUE SCRIPT                                               ###
 
 # Prioritize downloads matching a list of needles.
 #
-# When a new nzb is added, its name is checked against a configurable list
-# of needles (keywords). If any needle is found in the name, the download is
+# When an nzb is added, its name is checked against a configurable list of
+# needles (keywords). If any needle is found in the name, the download is
 # given a higher priority (and optionally moved to the top of the queue).
 #
-# NOTE: This script only affects the priority at the moment the nzb is added.
+# Runs both as a SCAN script (on the nzb being added) and as a QUEUE script
+# (on queue events like NZB_ADDED / URL_COMPLETED, also covering url downloads).
 
 ##############################################################################
 ### OPTIONS                                                                ###
@@ -60,7 +61,21 @@
 # added. Uses the RPC connection settings NZBGet passes to the script.
 #ApplyToQueue=no
 
-### NZBGET SCAN SCRIPT                                                     ###
+# Queue events to react to (comma separated).
+#
+# Only used when the script runs as a QUEUE script. Possible events:
+#   NZB_ADDED       - nzb was added to the queue (recommended);
+#   URL_COMPLETED   - a url download finished and became a real nzb (recommended);
+#   NZB_DOWNLOADED  - nzb finished downloading;
+#   FILE_DOWNLOADED - a single file finished (fires very often!);
+#   NZB_DELETED     - nzb was removed from the queue;
+#   NZB_MARKED      - nzb was marked (dupe/good/bad/...).
+#
+# For most events only the triggering nzb is (re-)prioritized. Enable
+# ApplyToQueue to instead re-check the whole queue on each of these events.
+#QueueEvents=NZB_ADDED, URL_COMPLETED
+
+### NZBGET SCAN/QUEUE SCRIPT                                               ###
 ##############################################################################
 
 import base64
@@ -249,17 +264,73 @@ def apply_to_queue(needles, mode, priority, move_to_top):
     log_detail("Queue scan finished - %d entr%s updated." % (count, "y" if count == 1 else "ies"))
 
 
+def handle_scan(needles, mode, priority, move_to_top):
+    """SCAN context: influence the nzb being added via stdout commands."""
+    nzb_name = os.environ["NZBNP_NZBNAME"]
+
+    # 1. Handle the nzb currently being added.
+    matched = name_matches(nzb_name, needles, mode)
+    if matched is None:
+        log_detail("No needle matched '%s'." % nzb_name)
+    else:
+        log_info("'%s' matched needle '%s' - setting priority to %s." % (nzb_name, matched, priority))
+        # Tell NZBGet to change the priority of the nzb being added.
+        print("[NZB] PRIORITY=%s" % priority)
+        if move_to_top:
+            log_detail("Moving '%s' to the top of the queue." % nzb_name)
+            print("[NZB] TOP=1")
+
+    # 2. Optionally re-prioritize nzbs already in the queue (via RPC).
+    if get_bool_option("ApplyToQueue", False):
+        apply_to_queue(needles, mode, priority, move_to_top)
+
+    return SUCCESS
+
+
+def prioritize_nzbid(name, nzbid, needle, priority, move_to_top):
+    """Set the priority of a single queued nzb via RPC."""
+    log_info("Queue: '%s' matched needle '%s' - priority set to %s." % (name, needle, priority))
+    editqueue("GroupSetPriority", priority, [nzbid])
+    if move_to_top:
+        editqueue("GroupMoveTop", 0, [nzbid])
+
+
+def handle_queue(needles, mode, priority, move_to_top):
+    """QUEUE context: react to a queue event."""
+    event = os.environ.get("NZBNA_EVENT", "")
+    wanted = [e.upper() for e in parse_needles(get_option("QueueEvents", "NZB_ADDED, URL_COMPLETED"))]
+    if event.upper() not in wanted:
+        log_detail("Ignoring queue event '%s' (not in QueueEvents)." % event)
+        return SUCCESS
+
+    # ApplyToQueue re-checks the entire queue; otherwise only the event's nzb.
+    if get_bool_option("ApplyToQueue", False):
+        apply_to_queue(needles, mode, priority, move_to_top)
+        return SUCCESS
+
+    name = os.environ.get("NZBNA_NZBNAME", "")
+    nzbid = os.environ.get("NZBNA_NZBID", "")
+    if not name or not nzbid:
+        log_detail("Queue event '%s' without name/id - nothing to do." % event)
+        return SUCCESS
+
+    needle = name_matches(name, needles, mode)
+    if needle is None:
+        log_detail("No needle matched '%s'." % name)
+        return SUCCESS
+
+    try:
+        prioritize_nzbid(name, int(nzbid), needle, priority, move_to_top)
+    except Exception as exc:  # noqa: BLE001
+        log_warning("Could not update queue entry '%s': %s" % (name, exc))
+    return SUCCESS
+
+
 def main():
-    # Ensure we are running inside NZBGet as a scan script.
+    # Ensure we are running inside NZBGet.
     if "NZBOP_SCRIPTDIR" not in os.environ:
         print("This script is supposed to be called from NZBGet (13.0 or later).")
         return ERROR
-
-    if "NZBNP_NZBNAME" not in os.environ:
-        log_error("NZBNP_NZBNAME is not set - this is not a scan-script context.")
-        return ERROR
-
-    nzb_name = os.environ["NZBNP_NZBNAME"]
 
     needles = parse_needles(get_option("NeedleList"))
     needles.extend(read_needle_file(get_option("NeedleFile").strip()))
@@ -281,23 +352,14 @@ def main():
 
     move_to_top = get_bool_option("MoveToTop", False)
 
-    # 1. Handle the nzb currently being added (via stdout commands).
-    matched = name_matches(nzb_name, needles, mode)
-    if matched is None:
-        log_detail("No needle matched '%s'." % nzb_name)
-    else:
-        log_info("'%s' matched needle '%s' - setting priority to %s." % (nzb_name, matched, priority))
-        # Tell NZBGet to change the priority of the nzb being added.
-        print("[NZB] PRIORITY=%s" % priority)
-        if move_to_top:
-            log_detail("Moving '%s' to the top of the queue." % nzb_name)
-            print("[NZB] TOP=1")
+    # Dispatch by context: SCAN sets NZBNP_*, QUEUE sets NZBNA_*.
+    if "NZBNP_NZBNAME" in os.environ:
+        return handle_scan(needles, mode, priority, move_to_top)
+    if "NZBNA_EVENT" in os.environ:
+        return handle_queue(needles, mode, priority, move_to_top)
 
-    # 2. Optionally re-prioritize nzbs already in the queue (via RPC).
-    if get_bool_option("ApplyToQueue", False):
-        apply_to_queue(needles, mode, priority, move_to_top)
-
-    return SUCCESS
+    log_error("Unknown context: neither scan (NZBNP_) nor queue (NZBNA_) variables set.")
+    return ERROR
 
 
 if __name__ == "__main__":
