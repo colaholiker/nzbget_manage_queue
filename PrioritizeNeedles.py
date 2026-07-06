@@ -226,12 +226,39 @@ def rpc_call(method, params):
     return payload.get("result")
 
 
+def to_int(value, default=0):
+    """Convert a value to int, falling back to default on failure."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def editqueue(command, param, ids):
     """Run editqueue, trying the modern 3-arg signature then the legacy 4-arg one."""
     try:
         return rpc_call("editqueue", [command, str(param), ids])
     except Exception:  # noqa: BLE001 - fall back to the older signature
         return rpc_call("editqueue", [command, 0, str(param), ids])
+
+
+def get_group_priority(group):
+    """Return a queue group's current priority."""
+    return to_int(group.get("Priority", group.get("MinPriority", 0)))
+
+
+def get_group_by_nzbid(nzbid):
+    """Return the queue group for a specific NZBID, or None."""
+    try:
+        groups = rpc_call("listgroups", [0])
+    except Exception as exc:  # noqa: BLE001
+        log_warning("Could not read the queue via RPC: %s" % exc)
+        return None
+
+    for group in groups or []:
+        if to_int(group.get("NZBID"), -1) == nzbid:
+            return group
+    return None
 
 
 def apply_to_queue(needles, mode, priority, move_to_top):
@@ -251,9 +278,13 @@ def apply_to_queue(needles, mode, priority, move_to_top):
         needle = name_matches(name, needles, mode)
         if needle is None:
             continue
+        current_priority = get_group_priority(group)
+        if current_priority == to_int(priority):
+            log_detail("Queue: '%s' already has priority %s - leaving it untouched." % (name, priority))
+            continue
         try:
             editqueue("GroupSetPriority", priority, [nzbid])
-            if move_to_top and needle is not None:
+            if move_to_top:
                 editqueue("GroupMoveTop", 0, [nzbid])
         except Exception as exc:  # noqa: BLE001
             log_warning("Could not update queue entry '%s': %s" % (name, exc))
@@ -289,9 +320,20 @@ def handle_scan(needles, mode, priority, move_to_top):
 
 def prioritize_nzbid(name, nzbid, needle, priority, move_to_top):
     """Set the priority of a single queued nzb via RPC."""
+    group = get_group_by_nzbid(nzbid)
+    if group is None:
+        log_warning("Could not determine current priority for queue entry '%s'." % name)
+        editqueue("GroupSetPriority", priority, [nzbid])
+        return
+
+    current_priority = get_group_priority(group)
+    if current_priority == to_int(priority):
+        log_detail("Queue: '%s' matched needle '%s' but already has priority %s - leaving it untouched." % (name, needle, priority))
+        return
+
     log_info("Queue: '%s' matched needle '%s' - priority set to %s." % (name, needle, priority))
     editqueue("GroupSetPriority", priority, [nzbid])
-    if move_to_top and needle is not None:
+    if move_to_top:
         editqueue("GroupMoveTop", 0, [nzbid])
 
 
