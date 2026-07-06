@@ -75,6 +75,20 @@
 # ApplyToQueue to instead re-check the whole queue on each of these events.
 #QueueEvents=NZB_ADDED, URL_COMPLETED
 
+# Queue sort order after a priority change.
+#
+# Comma-separated list of fields with direction, for example:
+#   priority:desc, age:asc, title:asc
+#
+# Supported fields:
+#   priority - NZBGet priority (higher or lower first, depending on direction)
+#   age      - post age / timestamp (older first with asc)
+#   title    - NZB title / name
+#
+# Direction can be written as ":asc" / ":desc" or with a leading "-".
+# Leave empty to disable queue sorting.
+#QueueSort=priority:desc, age:asc, title:asc
+
 ### NZBGET SCAN/QUEUE SCRIPT                                               ###
 ##############################################################################
 
@@ -119,6 +133,99 @@ def get_bool_option(name, default=False):
 def parse_needles(raw):
     """Split the comma separated needle list, dropping blanks."""
     return [n.strip() for n in raw.split(",") if n.strip()]
+
+
+def parse_queue_sort(raw):
+    """Parse a queue sort specification into (field, reverse) tuples."""
+    if not raw:
+        return []
+
+    default_directions = {
+        "priority": True,
+        "age": False,
+        "title": False,
+    }
+    field_aliases = {
+        "name": "title",
+        "nzbname": "title",
+        "nzbtitle": "title",
+        "priority": "priority",
+        "age": "age",
+        "time": "age",
+        "posttime": "age",
+    }
+    directions = {
+        "asc": False,
+        "ascending": False,
+        "up": False,
+        "desc": True,
+        "descending": True,
+        "down": True,
+    }
+
+    spec = []
+    for token in parse_needles(raw):
+        original = token
+        reverse = None
+        if token.startswith("-"):
+            reverse = True
+            token = token[1:].strip()
+
+        parts = [part.strip() for part in token.split(":", 1)]
+        field = parts[0].lower()
+        direction = parts[1].lower() if len(parts) == 2 else ""
+        field = field_aliases.get(field, field)
+        if field not in default_directions:
+            log_warning("Ignoring unknown QueueSort field '%s'." % original)
+            continue
+
+        if reverse is None:
+            if direction:
+                if direction not in directions:
+                    log_warning("Ignoring unknown QueueSort direction '%s' in '%s'." % (direction, original))
+                    continue
+                reverse = directions[direction]
+            else:
+                reverse = default_directions[field]
+
+        spec.append((field, reverse))
+
+    return spec
+
+
+def get_group_value(group, field):
+    """Return a sortable value for the requested queue field."""
+    if field == "priority":
+        value = group.get("Priority", group.get("MinPriority", 0))
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    if field == "age":
+        for key in ("PostTime", "MinPostTime", "Time", "AddedTime", "NZBDate"):
+            value = group.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    if field == "title":
+        value = group.get("NZBName") or group.get("NZBNicename") or ""
+        return value.casefold()
+
+    return ""
+
+
+def describe_sort_spec(sort_spec):
+    """Human-readable description of a queue sort specification."""
+    parts = []
+    for field, reverse in sort_spec:
+        parts.append("%s:%s" % (field, "desc" if reverse else "asc"))
+    return ", ".join(parts)
 
 
 def resolve_path(path):
@@ -234,7 +341,42 @@ def editqueue(command, param, ids):
         return rpc_call("editqueue", [command, 0, str(param), ids])
 
 
-def apply_to_queue(needles, mode, priority, move_to_top):
+def sort_queue(sort_spec):
+    """Sort the whole queue by repeatedly moving entries to the top."""
+    if not sort_spec:
+        return
+
+    try:
+        groups = rpc_call("listgroups", [0])
+    except Exception as exc:  # noqa: BLE001
+        log_warning("Could not read the queue for sorting via RPC: %s" % exc)
+        return
+
+    ordered = [group for group in groups or [] if group.get("NZBID") is not None]
+    if not ordered:
+        return
+
+    for field, reverse in reversed(sort_spec):
+        ordered.sort(key=lambda group, field=field: get_group_value(group, field), reverse=reverse)
+
+    moved = 0
+    for group in reversed(ordered):
+        nzbid = group.get("NZBID")
+        name = group.get("NZBName") or group.get("NZBNicename") or ""
+        if nzbid is None:
+            continue
+        try:
+            editqueue("GroupMoveTop", 0, [nzbid])
+        except Exception as exc:  # noqa: BLE001
+            log_warning("Could not move '%s' while sorting queue: %s" % (name, exc))
+            continue
+        moved += 1
+
+    log_detail("Queue sorted by %s (%d entr%s)."
+               % (describe_sort_spec(sort_spec), moved, "y" if moved == 1 else "ies"))
+
+
+def apply_to_queue(needles, mode, priority, move_to_top, sort_spec):
     """Re-prioritize every matching nzb already present in the download queue."""
     try:
         groups = rpc_call("listgroups", [0])
@@ -262,9 +404,11 @@ def apply_to_queue(needles, mode, priority, move_to_top):
         log_info("Queue: '%s' matched needle '%s' - priority set to %s." % (name, needle, priority))
 
     log_detail("Queue scan finished - %d entr%s updated." % (count, "y" if count == 1 else "ies"))
+    if sort_spec:
+        sort_queue(sort_spec)
 
 
-def handle_scan(needles, mode, priority, move_to_top):
+def handle_scan(needles, mode, priority, move_to_top, sort_spec):
     """SCAN context: influence the nzb being added via stdout commands."""
     nzb_name = os.environ["NZBNP_NZBNAME"]
 
@@ -282,20 +426,22 @@ def handle_scan(needles, mode, priority, move_to_top):
 
     # 2. Optionally re-prioritize nzbs already in the queue (via RPC).
     if get_bool_option("ApplyToQueue", False):
-        apply_to_queue(needles, mode, priority, move_to_top)
+        apply_to_queue(needles, mode, priority, move_to_top, sort_spec)
 
     return SUCCESS
 
 
-def prioritize_nzbid(name, nzbid, needle, priority, move_to_top):
+def prioritize_nzbid(name, nzbid, needle, priority, move_to_top, sort_spec):
     """Set the priority of a single queued nzb via RPC."""
     log_info("Queue: '%s' matched needle '%s' - priority set to %s." % (name, needle, priority))
     editqueue("GroupSetPriority", priority, [nzbid])
     if move_to_top:
         editqueue("GroupMoveTop", 0, [nzbid])
+    if sort_spec:
+        sort_queue(sort_spec)
 
 
-def handle_queue(needles, mode, priority, move_to_top):
+def handle_queue(needles, mode, priority, move_to_top, sort_spec):
     """QUEUE context: react to a queue event."""
     event = os.environ.get("NZBNA_EVENT", "")
     wanted = [e.upper() for e in parse_needles(get_option("QueueEvents", "NZB_ADDED, URL_COMPLETED"))]
@@ -305,7 +451,7 @@ def handle_queue(needles, mode, priority, move_to_top):
 
     # ApplyToQueue re-checks the entire queue; otherwise only the event's nzb.
     if get_bool_option("ApplyToQueue", False):
-        apply_to_queue(needles, mode, priority, move_to_top)
+        apply_to_queue(needles, mode, priority, move_to_top, sort_spec)
         return SUCCESS
 
     name = os.environ.get("NZBNA_NZBNAME", "")
@@ -320,7 +466,7 @@ def handle_queue(needles, mode, priority, move_to_top):
         return SUCCESS
 
     try:
-        prioritize_nzbid(name, int(nzbid), needle, priority, move_to_top)
+        prioritize_nzbid(name, int(nzbid), needle, priority, move_to_top, sort_spec)
     except Exception as exc:  # noqa: BLE001
         log_warning("Could not update queue entry '%s': %s" % (name, exc))
     return SUCCESS
@@ -351,12 +497,13 @@ def main():
         priority = "100"
 
     move_to_top = get_bool_option("MoveToTop", False)
+    sort_spec = parse_queue_sort(get_option("QueueSort", "priority:desc, age:asc, title:asc").strip())
 
     # Dispatch by context: SCAN sets NZBNP_*, QUEUE sets NZBNA_*.
     if "NZBNP_NZBNAME" in os.environ:
-        return handle_scan(needles, mode, priority, move_to_top)
+        return handle_scan(needles, mode, priority, move_to_top, sort_spec)
     if "NZBNA_EVENT" in os.environ:
-        return handle_queue(needles, mode, priority, move_to_top)
+        return handle_queue(needles, mode, priority, move_to_top, sort_spec)
 
     log_error("Unknown context: neither scan (NZBNP_) nor queue (NZBNA_) variables set.")
     return ERROR
