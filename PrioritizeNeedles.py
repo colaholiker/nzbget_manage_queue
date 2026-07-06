@@ -52,12 +52,23 @@
 # Move matched downloads to the top of the queue (yes, no).
 #MoveToTop=no
 
+# Also apply to nzbs already in the queue (yes, no).
+#
+# When enabled, every time a new nzb is added the whole download queue is
+# re-checked via NZBGet's RPC-API and all matching entries are (re-)prioritized.
+# This lets you catch downloads that were already queued before a needle was
+# added. Uses the RPC connection settings NZBGet passes to the script.
+#ApplyToQueue=no
+
 ### NZBGET SCAN SCRIPT                                                     ###
 ##############################################################################
 
+import base64
+import json
 import os
 import re
 import sys
+import urllib.request
 
 # NZBGet exit codes for scan scripts.
 SUCCESS = 93
@@ -176,6 +187,68 @@ def name_matches(nzb_name, needles, mode):
     return None
 
 
+def rpc_call(method, params):
+    """Call an NZBGet JSON-RPC method using the connection info NZBGet passes."""
+    host = os.environ.get("NZBOP_CONTROLIP", "127.0.0.1")
+    if host in ("0.0.0.0", ""):
+        host = "127.0.0.1"
+    port = os.environ.get("NZBOP_CONTROLPORT", "6789")
+    username = os.environ.get("NZBOP_CONTROLUSERNAME", "")
+    password = os.environ.get("NZBOP_CONTROLPASSWORD", "")
+
+    url = "http://%s:%s/jsonrpc" % (host, port)
+    body = json.dumps({"method": method, "params": params, "id": 1}).encode("utf-8")
+    request = urllib.request.Request(url, data=body)
+    request.add_header("Content-Type", "application/json")
+    if username or password:
+        token = base64.b64encode(("%s:%s" % (username, password)).encode("utf-8")).decode("ascii")
+        request.add_header("Authorization", "Basic " + token)
+
+    with urllib.request.urlopen(request, timeout=60) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if payload.get("error"):
+        raise RuntimeError(payload["error"])
+    return payload.get("result")
+
+
+def editqueue(command, param, ids):
+    """Run editqueue, trying the modern 3-arg signature then the legacy 4-arg one."""
+    try:
+        return rpc_call("editqueue", [command, str(param), ids])
+    except Exception:  # noqa: BLE001 - fall back to the older signature
+        return rpc_call("editqueue", [command, 0, str(param), ids])
+
+
+def apply_to_queue(needles, mode, priority, move_to_top):
+    """Re-prioritize every matching nzb already present in the download queue."""
+    try:
+        groups = rpc_call("listgroups", [0])
+    except Exception as exc:  # noqa: BLE001
+        log_warning("Could not read the queue via RPC: %s" % exc)
+        return
+
+    count = 0
+    for group in groups or []:
+        name = group.get("NZBName") or group.get("NZBNicename") or ""
+        nzbid = group.get("NZBID")
+        if not name or nzbid is None:
+            continue
+        needle = name_matches(name, needles, mode)
+        if needle is None:
+            continue
+        try:
+            editqueue("GroupSetPriority", priority, [nzbid])
+            if move_to_top:
+                editqueue("GroupMoveTop", 0, [nzbid])
+        except Exception as exc:  # noqa: BLE001
+            log_warning("Could not update queue entry '%s': %s" % (name, exc))
+            continue
+        count += 1
+        log_info("Queue: '%s' matched needle '%s' - priority set to %s." % (name, needle, priority))
+
+    log_detail("Queue scan finished - %d entr%s updated." % (count, "y" if count == 1 else "ies"))
+
+
 def main():
     # Ensure we are running inside NZBGet as a scan script.
     if "NZBOP_SCRIPTDIR" not in os.environ:
@@ -199,11 +272,6 @@ def main():
         log_warning("Unknown MatchMode '%s', falling back to 'substring'." % mode)
         mode = "substring"
 
-    matched = name_matches(nzb_name, needles, mode)
-    if matched is None:
-        log_detail("No needle matched '%s'." % nzb_name)
-        return SUCCESS
-
     priority = get_option("MatchPriority", "100").strip()
     try:
         priority = str(int(priority))
@@ -211,13 +279,23 @@ def main():
         log_warning("Invalid MatchPriority '%s', using 100." % priority)
         priority = "100"
 
-    log_info("'%s' matched needle '%s' - setting priority to %s." % (nzb_name, matched, priority))
-    # Tell NZBGet to change the priority of the nzb being added.
-    print("[NZB] PRIORITY=%s" % priority)
+    move_to_top = get_bool_option("MoveToTop", False)
 
-    if get_bool_option("MoveToTop", False):
-        log_detail("Moving '%s' to the top of the queue." % nzb_name)
-        print("[NZB] TOP=1")
+    # 1. Handle the nzb currently being added (via stdout commands).
+    matched = name_matches(nzb_name, needles, mode)
+    if matched is None:
+        log_detail("No needle matched '%s'." % nzb_name)
+    else:
+        log_info("'%s' matched needle '%s' - setting priority to %s." % (nzb_name, matched, priority))
+        # Tell NZBGet to change the priority of the nzb being added.
+        print("[NZB] PRIORITY=%s" % priority)
+        if move_to_top:
+            log_detail("Moving '%s' to the top of the queue." % nzb_name)
+            print("[NZB] TOP=1")
+
+    # 2. Optionally re-prioritize nzbs already in the queue (via RPC).
+    if get_bool_option("ApplyToQueue", False):
+        apply_to_queue(needles, mode, priority, move_to_top)
 
     return SUCCESS
 

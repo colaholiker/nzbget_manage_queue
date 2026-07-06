@@ -37,6 +37,7 @@ Requirements: NZBGet 13.0 or later and Python 3.
 | `MatchPriority` | Priority to assign on a match                                | `100`       |
 | `MatchMode`     | `substring` (plain text) or `regex` (Python regular expr.)   | `substring` |
 | `MoveToTop`     | Move matched downloads to the top of the queue (`yes` / `no`)| `no`        |
+| `ApplyToQueue`  | Also re-prioritize nzbs already in the queue (`yes` / `no`)   | `no`        |
 
 Matching **ignores case, spaces and dots** on both sides, so the needle
 `some movie` matches the name `Some.Movie.1080p`. In `regex` mode the pattern is
@@ -62,6 +63,19 @@ ubuntu
 -PROPER-
 S\d+E\d+
 ```
+
+### Applying to the whole queue
+
+By default the script only affects the nzb being added. Enable `ApplyToQueue`
+to also re-check the **entire download queue** on every add: the script queries
+NZBGet's RPC-API (`listgroups`) and re-prioritizes all matching entries
+(`editqueue`). This catches downloads that were already queued before a needle
+was configured.
+
+It uses the RPC connection settings NZBGet passes to the script
+(`ControlIP`/`ControlPort`/`ControlUsername`/`ControlPassword`), so no extra
+configuration is needed. If the queue can't be reached, a warning is logged and
+the newly added nzb is still handled normally.
 
 ### Priority values
 
