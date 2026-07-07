@@ -89,6 +89,10 @@ import urllib.request
 SUCCESS = 93
 ERROR = 94
 
+# Default priority assigned on a match (keep in sync with the #MatchPriority
+# default documented in the OPTIONS section above).
+DEFAULT_PRIORITY = "100"
+
 
 def log_info(message):
     print("[INFO] %s" % message)
@@ -343,12 +347,12 @@ def main():
         log_warning("Unknown MatchMode '%s', falling back to 'substring'." % mode)
         mode = "substring"
 
-    priority = get_option("MatchPriority", "100").strip()
+    priority = get_option("MatchPriority", DEFAULT_PRIORITY).strip()
     try:
         priority = str(int(priority))
     except ValueError:
-        log_warning("Invalid MatchPriority '%s', using 100." % priority)
-        priority = "100"
+        log_warning("Invalid MatchPriority '%s', using %s." % (priority, DEFAULT_PRIORITY))
+        priority = DEFAULT_PRIORITY
 
     move_to_top = get_bool_option("MoveToTop", False)
 
