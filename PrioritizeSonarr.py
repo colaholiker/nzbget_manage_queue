@@ -317,11 +317,14 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
     ordered = sorted(candidates, key=lambda sid: (candidates[sid]["total"], candidates[sid]["title"].lower()))
 
     # Pick the first series that still has enough left to download; series that
-    # are almost finished (< min_remaining_mb) are skipped for the next one.
+    # are almost finished (< min_remaining_mb) are skipped for the next one and
+    # left untouched (they keep whatever priority they have).
     winner_id = None
+    nearly_done = set()
     for series_id in ordered:
         remaining = candidates[series_id]["remaining"]
         if min_remaining_mb > 0 and remaining < min_remaining_mb:
+            nearly_done.add(series_id)
             log_detail("Skipping '%s' - only %d MB left (< %d MB)."
                        % (candidates[series_id]["title"], remaining, min_remaining_mb))
             continue
@@ -338,10 +341,11 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
         log_detail("No eligible series has at least %d MB left - nothing to prioritize." % min_remaining_mb)
 
     # Reset every other eligible series that still carries the boost priority
-    # back to normal, so only the target series stays prioritized.
+    # back to normal, so only the target series stays prioritized. Almost
+    # finished series are left untouched.
     boost = to_int(priority)
     for series_id, entry in candidates.items():
-        if series_id == winner_id:
+        if series_id == winner_id or series_id in nearly_done:
             continue
         for nzbid, name, current_priority in entry["groups"]:
             if current_priority == boost:
