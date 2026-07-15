@@ -45,6 +45,13 @@
 # Move the prioritized downloads to the top of the queue (yes, no).
 #MoveToTop=no
 
+# Skip series with less than this many MB left to download.
+#
+# A series whose queued downloads together have less than this much remaining
+# is considered almost finished and is skipped in favour of the next shortest
+# series. Set to 0 to disable.
+#MinRemainingMB=10
+
 # Queue events to react to (comma separated).
 #
 # Possible events:
@@ -246,7 +253,7 @@ def set_priority(name, nzbid, current_priority, priority, move_to_top):
     log_info("'%s' priority set to %s." % (name, priority))
 
 
-def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to_top):
+def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb):
     """Prioritize the downloads of the queued Sonarr series with fewest episodes."""
     try:
         series_list = sonarr_request(base_url, api_key, "/series")
@@ -296,22 +303,39 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
         entry = candidates.setdefault(series_id, {
             "title": series.get("title", "?"),
             "total": series_total_episodes(series),
+            "remaining": 0,
             "groups": [],
         })
+        entry["remaining"] += to_int(group.get("RemainingSizeMB"), 0)
         entry["groups"].append((to_int(nzbid, -1), name, get_group_priority(group)))
 
     if not candidates:
         log_detail("No queued download could be matched to an eligible Sonarr series.")
         return
 
-    # Winner: fewest episodes in total; ties broken alphabetically by series title.
-    winner_id = min(candidates, key=lambda sid: (candidates[sid]["total"], candidates[sid]["title"].lower()))
-    winner = candidates[winner_id]
-    log_info("Target series: '%s' (%d episode(s) total) - prioritizing %d download(s)."
-             % (winner["title"], winner["total"], len(winner["groups"])))
+    # Order eligible series by fewest episodes, ties broken alphabetically by title.
+    ordered = sorted(candidates, key=lambda sid: (candidates[sid]["total"], candidates[sid]["title"].lower()))
 
-    for nzbid, name, current_priority in winner["groups"]:
-        set_priority(name, nzbid, current_priority, priority, move_to_top)
+    # Pick the first series that still has enough left to download; series that
+    # are almost finished (< min_remaining_mb) are skipped for the next one.
+    winner_id = None
+    for series_id in ordered:
+        remaining = candidates[series_id]["remaining"]
+        if min_remaining_mb > 0 and remaining < min_remaining_mb:
+            log_detail("Skipping '%s' - only %d MB left (< %d MB)."
+                       % (candidates[series_id]["title"], remaining, min_remaining_mb))
+            continue
+        winner_id = series_id
+        break
+
+    if winner_id is not None:
+        winner = candidates[winner_id]
+        log_info("Target series: '%s' (%d episode(s) total, %d MB left) - prioritizing %d download(s)."
+                 % (winner["title"], winner["total"], winner["remaining"], len(winner["groups"])))
+        for nzbid, name, current_priority in winner["groups"]:
+            set_priority(name, nzbid, current_priority, priority, move_to_top)
+    else:
+        log_detail("No eligible series has at least %d MB left - nothing to prioritize." % min_remaining_mb)
 
     # Reset every other eligible series that still carries the boost priority
     # back to normal, so only the target series stays prioritized.
@@ -328,7 +352,7 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
 # Entry point
 # --------------------------------------------------------------------------
 
-def handle_queue(base_url, api_key, exclude_tag, priority, move_to_top):
+def handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb):
     """QUEUE context: react to a queue event."""
     event = os.environ.get("NZBNA_EVENT", "")
     wanted = [e.upper() for e in parse_list(get_option("QueueEvents", "NZB_ADDED, URL_COMPLETED"))]
@@ -336,7 +360,7 @@ def handle_queue(base_url, api_key, exclude_tag, priority, move_to_top):
         log_detail("Ignoring queue event '%s' (not in QueueEvents)." % event)
         return SUCCESS
 
-    prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to_top)
+    prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb)
     return SUCCESS
 
 
@@ -362,9 +386,10 @@ def main():
         priority = DEFAULT_PRIORITY
 
     move_to_top = get_bool_option("MoveToTop", False)
+    min_remaining_mb = to_int(get_option("MinRemainingMB", "10").strip(), 10)
 
     if "NZBNA_EVENT" in os.environ:
-        return handle_queue(base_url, api_key, exclude_tag, priority, move_to_top)
+        return handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb)
 
     log_error("Unknown context: queue variables (NZBNA_) not set. This is a QUEUE script.")
     return ERROR
