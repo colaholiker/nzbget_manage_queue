@@ -306,8 +306,12 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
             "remaining": 0,
             "groups": [],
         })
-        entry["remaining"] += to_int(group.get("RemainingSizeMB"), 0)
+        remaining_mb = to_int(group.get("RemainingSizeMB"), 0)
+        paused_mb = to_int(group.get("PausedSizeMB"), 0)
+        entry["remaining"] += remaining_mb
         entry["groups"].append((to_int(nzbid, -1), name, get_group_priority(group)))
+        log_detail("'%s' -> series '%s': %d MB left (%d MB paused)."
+                   % (name, entry["title"], remaining_mb, paused_mb))
 
     if not candidates:
         log_detail("No queued download could be matched to an eligible Sonarr series.")
@@ -316,36 +320,45 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
     # Order eligible series by fewest episodes, ties broken alphabetically by title.
     ordered = sorted(candidates, key=lambda sid: (candidates[sid]["total"], candidates[sid]["title"].lower()))
 
-    # Pick the first series that still has enough left to download; series that
-    # are almost finished (< min_remaining_mb) are skipped for the next one and
-    # left untouched (they keep whatever priority they have).
+    # Series to keep prioritized. Almost finished series (< min_remaining_mb)
+    # stay boosted so they cross the finish line, ...
+    prioritized = set()
+    for series_id in candidates:
+        if min_remaining_mb > 0 and candidates[series_id]["remaining"] < min_remaining_mb:
+            prioritized.add(series_id)
+
+    # ... plus the shortest series that still has real work left (the target).
     winner_id = None
-    nearly_done = set()
     for series_id in ordered:
-        remaining = candidates[series_id]["remaining"]
-        if min_remaining_mb > 0 and remaining < min_remaining_mb:
-            nearly_done.add(series_id)
-            log_detail("Skipping '%s' - only %d MB left (< %d MB)."
-                       % (candidates[series_id]["title"], remaining, min_remaining_mb))
-            continue
-        winner_id = series_id
-        break
+        if series_id not in prioritized:
+            winner_id = series_id
+            break
 
     if winner_id is not None:
         winner = candidates[winner_id]
+        prioritized.add(winner_id)
         log_info("Target series: '%s' (%d episode(s) total, %d MB left) - prioritizing %d download(s)."
                  % (winner["title"], winner["total"], winner["remaining"], len(winner["groups"])))
         for nzbid, name, current_priority in winner["groups"]:
             set_priority(name, nzbid, current_priority, priority, move_to_top)
-    else:
-        log_detail("No eligible series has at least %d MB left - nothing to prioritize." % min_remaining_mb)
 
-    # Reset every other eligible series that still carries the boost priority
-    # back to normal, so only the target series stays prioritized. Almost
-    # finished series are left untouched.
+    # Keep the almost finished series on priority as well (never moved to top).
+    for series_id in prioritized:
+        if series_id == winner_id:
+            continue
+        entry = candidates[series_id]
+        log_detail("Keeping almost finished '%s' (%d MB left) prioritized."
+                   % (entry["title"], entry["remaining"]))
+        for nzbid, name, current_priority in entry["groups"]:
+            set_priority(name, nzbid, current_priority, priority, False)
+
+    if not prioritized:
+        log_detail("No eligible series to prioritize.")
+
+    # Reset every other series that still carries the boost priority to normal.
     boost = to_int(priority)
     for series_id, entry in candidates.items():
-        if series_id == winner_id or series_id in nearly_done:
+        if series_id in prioritized:
             continue
         for nzbid, name, current_priority in entry["groups"]:
             if current_priority == boost:
