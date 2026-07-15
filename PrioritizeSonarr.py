@@ -73,6 +73,9 @@ ERROR = 94
 # #MatchPriority default documented in the OPTIONS section above).
 DEFAULT_PRIORITY = "100"
 
+# NZBGet's "normal" priority - other eligible series are reset to this.
+NORMAL_PRIORITY = "0"
+
 
 def log_info(message):
     print("[INFO] %s" % message)
@@ -309,6 +312,16 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
 
     for nzbid, name, current_priority in winner["groups"]:
         set_priority(name, nzbid, current_priority, priority, move_to_top)
+
+    # Reset every other eligible series that still carries the boost priority
+    # back to normal, so only the target series stays prioritized.
+    boost = to_int(priority)
+    for series_id, entry in candidates.items():
+        if series_id == winner_id:
+            continue
+        for nzbid, name, current_priority in entry["groups"]:
+            if current_priority == boost:
+                set_priority(name, nzbid, current_priority, NORMAL_PRIORITY, False)
 
 
 # --------------------------------------------------------------------------
