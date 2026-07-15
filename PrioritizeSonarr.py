@@ -301,8 +301,8 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
         log_detail("No queued download could be matched to an eligible Sonarr series.")
         return
 
-    # Winner: fewest episodes in total; ties broken by lowest seriesId for determinism.
-    winner_id = min(candidates, key=lambda sid: (candidates[sid]["total"], sid))
+    # Winner: fewest episodes in total; ties broken alphabetically by series title.
+    winner_id = min(candidates, key=lambda sid: (candidates[sid]["total"], candidates[sid]["title"].lower()))
     winner = candidates[winner_id]
     log_info("Target series: '%s' (%d episode(s) total) - prioritizing %d download(s)."
              % (winner["title"], winner["total"], len(winner["groups"])))
