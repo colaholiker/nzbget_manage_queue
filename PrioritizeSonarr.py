@@ -306,12 +306,15 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
             "remaining": 0,
             "groups": [],
         })
+        # Ignore paused parts (e.g. par2 files NZBGet only fetches on demand);
+        # count only what will actually be downloaded.
         remaining_mb = to_int(group.get("RemainingSizeMB"), 0)
         paused_mb = to_int(group.get("PausedSizeMB"), 0)
-        entry["remaining"] += remaining_mb
+        active_mb = max(0, remaining_mb - paused_mb)
+        entry["remaining"] += active_mb
         entry["groups"].append((to_int(nzbid, -1), name, get_group_priority(group)))
-        log_detail("'%s' -> series '%s': %d MB left (%d MB paused)."
-                   % (name, entry["title"], remaining_mb, paused_mb))
+        log_detail("'%s' -> series '%s': %d MB to download (%d MB total, %d MB paused)."
+                   % (name, entry["title"], active_mb, remaining_mb, paused_mb))
 
     if not candidates:
         log_detail("No queued download could be matched to an eligible Sonarr series.")
