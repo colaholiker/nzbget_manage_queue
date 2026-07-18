@@ -45,6 +45,17 @@
 # Move the prioritized downloads to the top of the queue (yes, no).
 #MoveToTop=no
 
+# Ignore leading articles when sorting series alphabetically (yes, no).
+#
+# When ties are broken alphabetically, a leading article is stripped first, so
+# "The Boys" sorts under B and "Der Tatortreiniger" under T.
+#IgnoreLeadingArticles=yes
+
+# Leading articles to ignore (comma separated, case-insensitive).
+#
+# Only used when IgnoreLeadingArticles is enabled.
+#SortArticles=the, a, an, der, die, das, den, dem, des
+
 # Skip series with less than this many MB left to download.
 #
 # A series whose queued downloads together have less than this much remaining
@@ -126,6 +137,24 @@ def to_int(value, default=0):
 def normalize(text):
     """Lower-case and drop spaces and dots so separators don't matter."""
     return re.sub(r"[\s.]+", "", text or "").lower()
+
+
+# Default leading articles ignored when sorting titles (English/German).
+DEFAULT_SORT_ARTICLES = "the, a, an, der, die, das, den, dem, des"
+
+
+def sort_title(text, articles):
+    """Return a lower-cased title with a leading article stripped for sorting.
+
+    ``articles`` is a set of lower-cased words; if empty, nothing is stripped.
+    """
+    title = (text or "").strip().lower()
+    if not articles:
+        return title
+    match = re.match(r"^(\w+)\s+(.*)$", title)
+    if match and match.group(1) in articles:
+        return match.group(2)
+    return title
 
 
 # --------------------------------------------------------------------------
@@ -253,7 +282,7 @@ def set_priority(name, nzbid, current_priority, priority, move_to_top):
     log_info("'%s' priority set to %s." % (name, priority))
 
 
-def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb):
+def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb, sort_articles):
     """Prioritize the downloads of the queued Sonarr series with fewest episodes."""
     try:
         series_list = sonarr_request(base_url, api_key, "/series")
@@ -321,7 +350,7 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
         return
 
     # Order eligible series by fewest episodes, ties broken alphabetically by title.
-    ordered = sorted(candidates, key=lambda sid: (candidates[sid]["total"], candidates[sid]["title"].lower()))
+    ordered = sorted(candidates, key=lambda sid: (candidates[sid]["total"], sort_title(candidates[sid]["title"], sort_articles)))
 
     # Series to keep prioritized. Almost finished series (< min_remaining_mb)
     # stay boosted so they cross the finish line, ...
@@ -372,7 +401,7 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
 # Entry point
 # --------------------------------------------------------------------------
 
-def handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb):
+def handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb, sort_articles):
     """QUEUE context: react to a queue event."""
     event = os.environ.get("NZBNA_EVENT", "")
     wanted = [e.upper() for e in parse_list(get_option("QueueEvents", "NZB_ADDED, URL_COMPLETED"))]
@@ -380,7 +409,7 @@ def handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_rema
         log_detail("Ignoring queue event '%s' (not in QueueEvents)." % event)
         return SUCCESS
 
-    prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb)
+    prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb, sort_articles)
     return SUCCESS
 
 
@@ -408,8 +437,13 @@ def main():
     move_to_top = get_bool_option("MoveToTop", False)
     min_remaining_mb = to_int(get_option("MinRemainingMB", "10").strip(), 10)
 
+    if get_bool_option("IgnoreLeadingArticles", True):
+        sort_articles = {a.lower() for a in parse_list(get_option("SortArticles", DEFAULT_SORT_ARTICLES))}
+    else:
+        sort_articles = set()
+
     if "NZBNA_EVENT" in os.environ:
-        return handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb)
+        return handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb, sort_articles)
 
     log_error("Unknown context: queue variables (NZBNA_) not set. This is a QUEUE script.")
     return ERROR
