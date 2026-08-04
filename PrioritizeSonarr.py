@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Prioritize the Sonarr series with the fewest episodes in the download queue.
+# Prioritize the  Sonarr series with the fewest episodes in the download queue.
 #
 ##############################################################################
 ### NZBGET QUEUE SCRIPT                                                    ###
