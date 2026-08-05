@@ -7,6 +7,9 @@ When an nzb is added, its name is checked against the needle list. On a match
 the download gets a higher priority and can optionally be moved to the top of
 the queue. Everything else is left untouched.
 
+Independently of the needles, downloads below a configurable size can be given
+the *force* priority — see [`ForceBelowMB`](#forcing-small-downloads).
+
 ## How it works
 
 The script runs in two contexts:
@@ -41,6 +44,7 @@ Requirements: NZBGet 13.0 or later and Python 3.
 | `NeedleList`    | Comma-separated needles, e.g. `1080p, ubuntu, -PROPER-`      | *(empty)*   |
 | `NeedleFile`    | Path to a file with one needle per line (for longer lists)   | *(empty)*   |
 | `MatchPriority` | Priority to assign on a match                                | `100`       |
+| `ForceBelowMB`  | Force downloads smaller than this many MB (`0` disables)     | `0`         |
 | `MatchMode`     | `substring` (plain text) or `regex` (Python regular expr.)   | `substring` |
 | `MoveToTop`     | Move matched downloads to the top of the queue (`yes` / `no`)| `no`        |
 | `ApplyToQueue`  | Also re-prioritize nzbs already in the queue (`yes` / `no`)   | `no`        |
@@ -71,13 +75,38 @@ ubuntu
 S\d+E\d+
 ```
 
+### Forcing small downloads
+
+Set `ForceBelowMB` to a size in MB and every download **below** that size gets
+NZBGet's `900` (*force*) priority, so it runs even while the queue is paused —
+a 20 MB subtitle pack no longer waits behind a 50 GB release. No needle has to
+match: this applies to every download the script looks at, and `NeedleList` /
+`NeedleFile` may stay empty. If a download is both small **and** matches a
+needle, force wins, being the higher of the two priorities.
+
+`0` (the default) disables the rule and keeps the script needle-only.
+
+Two limitations worth knowing:
+
+- **Queue script only.** While an nzb is being *scanned*, NZBGet has not parsed
+  it yet and does not report a size, so the rule cannot be applied there. Make
+  sure the extension is also enabled as a **queue script** (see below); the
+  scan run logs a reminder when `ForceBelowMB` is set.
+- **Only downloads the script sees.** Without `ApplyToQueue` that is the nzb
+  that triggered the event. Enable `ApplyToQueue` to have the whole queue
+  checked against the size threshold on every event.
+
+The size compared is the download's **total** size as reported by NZBGet, not
+what is left of it — a nearly finished 50 GB download is not "small".
+
 ### Applying to the whole queue
 
 By default the script only affects the nzb being added. Enable `ApplyToQueue`
 to also re-check the **entire download queue** on every add: the script queries
 NZBGet's RPC-API (`listgroups`) and re-prioritizes all matching entries
 (`editqueue`). This catches downloads that were already queued before a needle
-was configured.
+was configured — and, with `ForceBelowMB` set, all small entries already in the
+queue.
 
 It uses the RPC connection settings NZBGet passes to the script
 (`ControlIP`/`ControlPort`/`ControlUsername`/`ControlPassword`), so no extra
@@ -118,6 +147,9 @@ With `NeedleList = 1080p, ubuntu` and `MatchPriority = 900`:
 - `Ubuntu.24.04.iso.nzb` → matches `ubuntu` → priority set to `900`
 - `Movie.1080p.nzb`      → matches `1080p` → priority set to `900`
 - `Random.720p.nzb`      → no match → left unchanged
+
+With `ForceBelowMB = 100` on top of that, a queued `Random.720p` of 40 MB is
+forced to `900` despite matching no needle, while a 4 GB one stays untouched.
 
 ## Testing without NZBGet
 

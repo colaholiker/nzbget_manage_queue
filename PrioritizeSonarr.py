@@ -249,7 +249,7 @@ def sonarr_request(base_url, api_key, path):
 # than a single page returns; unfetched records stay unmapped, which used to
 # leave their downloads out of the reset below.
 SONARR_QUEUE_PAGE_SIZE = 500
-SONARR_QUEUE_MAX_PAGES = 20
+SONARR_QUEUE_MAX_PAGES = 100
 
 
 def sonarr_queue_records(base_url, api_key):

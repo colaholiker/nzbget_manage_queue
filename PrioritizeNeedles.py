@@ -11,6 +11,10 @@
 # needles (keywords). If any needle is found in the name, the download is
 # given a higher priority (and optionally moved to the top of the queue).
 #
+# Independently of the needles, downloads below a configurable size can be
+# given NZBGet's "force" priority (see ForceBelowMB), so a small download
+# never has to wait behind a huge one.
+#
 # Runs both as a SCAN script (on the nzb being added) and as a QUEUE script
 # (on queue events like NZB_ADDED / URL_COMPLETED, also covering url downloads).
 
@@ -40,6 +44,17 @@
 # 50 (high), 100 (very high), 900 (force - downloads even while paused).
 # Any integer is accepted.
 #MatchPriority=100
+
+# Force downloads smaller than this many MB (0 disables).
+#
+# A download whose total size is below this threshold gets NZBGet's "force"
+# priority (900), so it downloads even while the queue is paused. No needle
+# has to match - every download the script looks at is checked. Being small
+# wins over a needle match, force being the higher priority of the two.
+#
+# This only works while running as a QUEUE script: when an nzb is scanned its
+# size is not known yet.
+#ForceBelowMB=0
 
 # How needles are matched against the name (substring, regex).
 #
@@ -92,6 +107,10 @@ ERROR = 94
 # Default priority assigned on a match (keep in sync with the #MatchPriority
 # default documented in the OPTIONS section above).
 DEFAULT_PRIORITY = "100"
+
+# NZBGet's "force" priority - such downloads run even while the queue is
+# paused. Assigned to downloads below ForceBelowMB.
+FORCE_PRIORITY = "900"
 
 
 def log_info(message):
@@ -251,6 +270,36 @@ def get_group_priority(group):
     return to_int(group.get("Priority", group.get("MinPriority", 0)))
 
 
+def get_group_size_mb(group):
+    """Return a queue group's total size in MB, or 0 if NZBGet doesn't report it.
+
+    The exact size comes as two 32-bit halves; 'FileSizeMB' is truncated and
+    reports 0 for anything below 1 MB, which would make a tiny download look
+    like one whose size is still unknown.
+    """
+    if "FileSizeLo" in group or "FileSizeHi" in group:
+        size = (to_int(group.get("FileSizeHi"), 0) << 32) + to_int(group.get("FileSizeLo"), 0)
+        return size / (1024.0 * 1024.0)
+    return float(to_int(group.get("FileSizeMB"), 0))
+
+
+def target_priority(group, needle, priority, force_below_mb):
+    """Decide which priority a queue group should get.
+
+    Returns a (priority, reason) pair, or (None, None) when the group is none
+    of our business. A small download is forced even without a needle match;
+    force being the higher priority, it also wins over one.
+    """
+    if force_below_mb > 0:
+        size_mb = get_group_size_mb(group)
+        # A size of 0 means NZBGet doesn't know it yet - that is not "small".
+        if 0 < size_mb < force_below_mb:
+            return FORCE_PRIORITY, "is only %.1f MB (below ForceBelowMB %d)" % (size_mb, force_below_mb)
+    if needle is not None:
+        return priority, "matched needle '%s'" % needle
+    return None, None
+
+
 def get_group_by_nzbid(nzbid):
     """Return the queue group for a specific NZBID, or None."""
     try:
@@ -265,8 +314,8 @@ def get_group_by_nzbid(nzbid):
     return None
 
 
-def apply_to_queue(needles, mode, priority, move_to_top):
-    """Re-prioritize every matching nzb already present in the download queue."""
+def apply_to_queue(needles, mode, priority, move_to_top, force_below_mb):
+    """Re-prioritize every eligible nzb already present in the download queue."""
     try:
         groups = rpc_call("listgroups", [0])
     except Exception as exc:  # noqa: BLE001
@@ -280,30 +329,35 @@ def apply_to_queue(needles, mode, priority, move_to_top):
         if not name or nzbid is None:
             continue
         needle = name_matches(name, needles, mode)
-        if needle is None:
+        target, reason = target_priority(group, needle, priority, force_below_mb)
+        if target is None:
             continue
         current_priority = get_group_priority(group)
-        if current_priority == to_int(priority):
-            log_detail("Queue: '%s' already has priority %s - leaving it untouched." % (name, priority))
+        if current_priority == to_int(target):
+            log_detail("Queue: '%s' already has priority %s - leaving it untouched." % (name, target))
             continue
         try:
-            editqueue("GroupSetPriority", priority, [nzbid])
+            editqueue("GroupSetPriority", target, [nzbid])
             if move_to_top:
                 editqueue("GroupMoveTop", 0, [nzbid])
         except Exception as exc:  # noqa: BLE001
             log_warning("Could not update queue entry '%s': %s" % (name, exc))
             continue
         count += 1
-        log_info("Queue: '%s' matched needle '%s' - priority set to %s." % (name, needle, priority))
+        log_info("Queue: '%s' %s - priority set to %s." % (name, reason, target))
 
     log_detail("Queue scan finished - %d entr%s updated." % (count, "y" if count == 1 else "ies"))
 
 
-def handle_scan(needles, mode, priority, move_to_top):
+def handle_scan(needles, mode, priority, move_to_top, force_below_mb):
     """SCAN context: influence the nzb being added via stdout commands."""
     nzb_name = os.environ["NZBNP_NZBNAME"]
 
-    # 1. Handle the nzb currently being added.
+    # 1. Handle the nzb currently being added. ForceBelowMB cannot be applied
+    #    here - while an nzb is scanned NZBGet does not know its size yet.
+    if force_below_mb > 0:
+        log_detail("ForceBelowMB is only applied by the queue script - the size of "
+                   "'%s' is not known while scanning." % nzb_name)
     matched = name_matches(nzb_name, needles, mode)
     if matched is None:
         log_detail("No needle matched '%s'." % nzb_name)
@@ -317,31 +371,41 @@ def handle_scan(needles, mode, priority, move_to_top):
 
     # 2. Optionally re-prioritize nzbs already in the queue (via RPC).
     if get_bool_option("ApplyToQueue", False):
-        apply_to_queue(needles, mode, priority, move_to_top)
+        apply_to_queue(needles, mode, priority, move_to_top, force_below_mb)
 
     return SUCCESS
 
 
-def prioritize_nzbid(name, nzbid, needle, priority, move_to_top):
+def prioritize_nzbid(name, nzbid, needle, priority, move_to_top, force_below_mb):
     """Set the priority of a single queued nzb via RPC."""
     group = get_group_by_nzbid(nzbid)
     if group is None:
+        # Without the group there is no size to check, so only a needle match
+        # can still be acted upon.
+        if needle is None:
+            log_warning("Could not read queue entry '%s' - cannot check its size." % name)
+            return
         log_warning("Could not determine current priority for queue entry '%s'." % name)
         editqueue("GroupSetPriority", priority, [nzbid])
         return
 
-    current_priority = get_group_priority(group)
-    if current_priority == to_int(priority):
-        log_detail("Queue: '%s' matched needle '%s' but already has priority %s - leaving it untouched." % (name, needle, priority))
+    target, reason = target_priority(group, needle, priority, force_below_mb)
+    if target is None:
+        log_detail("No needle matched '%s'." % name)
         return
 
-    log_info("Queue: '%s' matched needle '%s' - priority set to %s." % (name, needle, priority))
-    editqueue("GroupSetPriority", priority, [nzbid])
+    current_priority = get_group_priority(group)
+    if current_priority == to_int(target):
+        log_detail("Queue: '%s' %s but already has priority %s - leaving it untouched." % (name, reason, target))
+        return
+
+    log_info("Queue: '%s' %s - priority set to %s." % (name, reason, target))
+    editqueue("GroupSetPriority", target, [nzbid])
     if move_to_top:
         editqueue("GroupMoveTop", 0, [nzbid])
 
 
-def handle_queue(needles, mode, priority, move_to_top):
+def handle_queue(needles, mode, priority, move_to_top, force_below_mb):
     """QUEUE context: react to a queue event."""
     event = os.environ.get("NZBNA_EVENT", "")
     wanted = [e.upper() for e in parse_needles(get_option("QueueEvents", "NZB_ADDED, URL_COMPLETED"))]
@@ -351,7 +415,7 @@ def handle_queue(needles, mode, priority, move_to_top):
 
     # ApplyToQueue re-checks the entire queue; otherwise only the event's nzb.
     if get_bool_option("ApplyToQueue", False):
-        apply_to_queue(needles, mode, priority, move_to_top)
+        apply_to_queue(needles, mode, priority, move_to_top, force_below_mb)
         return SUCCESS
 
     name = os.environ.get("NZBNA_NZBNAME", "")
@@ -360,13 +424,15 @@ def handle_queue(needles, mode, priority, move_to_top):
         log_detail("Queue event '%s' without name/id - nothing to do." % event)
         return SUCCESS
 
+    # An unmatched name is only worth a queue lookup when its size can still
+    # earn it the force priority.
     needle = name_matches(name, needles, mode)
-    if needle is None:
+    if needle is None and force_below_mb <= 0:
         log_detail("No needle matched '%s'." % name)
         return SUCCESS
 
     try:
-        prioritize_nzbid(name, int(nzbid), needle, priority, move_to_top)
+        prioritize_nzbid(name, int(nzbid), needle, priority, move_to_top, force_below_mb)
     except Exception as exc:  # noqa: BLE001
         log_warning("Could not update queue entry '%s': %s" % (name, exc))
     return SUCCESS
@@ -380,8 +446,16 @@ def main():
 
     needles = parse_needles(get_option("NeedleList"))
     needles.extend(read_needle_file(get_option("NeedleFile").strip()))
-    if not needles:
-        log_detail("No needles configured (NeedleList/NeedleFile) - nothing to prioritize.")
+
+    force_below_mb = to_int(get_option("ForceBelowMB", "0").strip(), 0)
+    if force_below_mb < 0:
+        force_below_mb = 0
+
+    # Without needles the script still has work to do as long as small
+    # downloads are to be forced.
+    if not needles and force_below_mb <= 0:
+        log_detail("No needles configured (NeedleList/NeedleFile) and ForceBelowMB disabled"
+                   " - nothing to prioritize.")
         return SUCCESS
 
     mode = get_option("MatchMode", "substring").strip().lower()
@@ -399,9 +473,9 @@ def main():
     move_to_top = get_bool_option("MoveToTop", False)
     # Dispatch by context: SCAN sets NZBNP_*, QUEUE sets NZBNA_*.
     if "NZBNP_NZBNAME" in os.environ:
-        return handle_scan(needles, mode, priority, move_to_top)
+        return handle_scan(needles, mode, priority, move_to_top, force_below_mb)
     if "NZBNA_EVENT" in os.environ:
-        return handle_queue(needles, mode, priority, move_to_top)
+        return handle_queue(needles, mode, priority, move_to_top, force_below_mb)
 
     log_error("Unknown context: neither scan (NZBNP_) nor queue (NZBNA_) variables set.")
     return ERROR
