@@ -3,9 +3,10 @@
 ##############################################################################
 ### NZBGET POST-PROCESSING SCRIPT                                           ###
 
-# Merge multiple MKV parts for episode releases only.
+# Merge multiple MKV parts for episode and CD-split releases.
 #
-# This script checks if the NZB name contains an episode tag like E09.
+# This script checks if the NZB name contains an episode tag like E09,
+# or if the release is split into CD parts (cd1/cd2 as file or folder name).
 # If yes, it merges all non-sample MKV files larger than MIN_SIZE_MB.
 #
 ##############################################################################
@@ -22,22 +23,35 @@ fi
 
 cd "$TARGET_DIR" || exit 94
 
-# PRÜFUNG: Enthält der Paketname ein "E" gefolgt von zwei Zahlen? (z.B. E09)
+# 1. Sammle alle echten MKVs (ohne Samples) - auch aus Unterordnern (z.B. CD1/, CD2/)
+#    Natürliche Sortierung (sort -V), damit cd1 vor cd2 bzw. part1 vor part10 landet.
+shopt -s nocasematch
+files=()
+while IFS= read -r -d '' f; do
+    f="${f#./}"
+    [[ "$f" == *"sample"* ]] && continue
+    [ "$(du -m "$f" | cut -f1)" -lt "$MIN_SIZE_MB" ] && continue
+    files+=( "$f" )
+done < <(find . -maxdepth 2 -type f -iname '*.mkv' ! -name "${FINAL_NAME}.mkv" -print0 | sort -zV)
+
+# 2. Trigger prüfen: Episoden-Tag im Paketnamen ODER CD-Split in Datei-/Ordnernamen
+reason=""
 if [[ "$FINAL_NAME" =~ E[0-9]{2} ]]; then
-    echo "[INFO] Episoden-Tag erkannt im Paket: $FINAL_NAME"
-
-    # 1. Sammle alle echten MKVs (ohne Samples)
-    shopt -s nocaseglob
-    files=()
-    for f in *.mkv; do
-        [ -e "$f" ] || continue
-        [[ "$f" == *"sample"* ]] && continue
-        [ "$(du -m "$f" | cut -f1)" -lt "$MIN_SIZE_MB" ] && continue
-        files+=( "$f" )
+    reason="Episoden-Tag erkannt im Paket: $FINAL_NAME"
+else
+    for f in "${files[@]}"; do
+        if [[ "$f" =~ (^|[^a-z0-9])cd[0-9]+([^a-z0-9]|$) ]]; then
+            reason="CD-Split erkannt: $f"
+            break
+        fi
     done
-    shopt -u nocaseglob
+fi
+shopt -u nocasematch
 
-    # 2. Nur mergen, wenn tatsächlich mehr als eine Datei existiert
+if [ -n "$reason" ]; then
+    echo "[INFO] $reason"
+
+    # 3. Nur mergen, wenn tatsächlich mehr als eine Datei existiert
     if [ ${#files[@]} -ge 2 ]; then
         echo "[INFO] Mehrere Teile gefunden (${#files[@]}). Starte mkvmerge..."
 
@@ -52,6 +66,8 @@ if [[ "$FINAL_NAME" =~ E[0-9]{2} ]]; then
             for f in "${files[@]}"; do
                 rm "$f"
             done
+            # Leere Unterordner (z.B. CD1/, CD2/) entfernen
+            find . -mindepth 1 -maxdepth 1 -type d -empty -exec rmdir {} \; 2>/dev/null
             exit 93
         else
             echo "[ERROR] Fehler bei mkvmerge!"
@@ -62,6 +78,6 @@ if [[ "$FINAL_NAME" =~ E[0-9]{2} ]]; then
         exit 95
     fi
 else
-    echo "[INFO] Kein Episoden-Tag (E??) gefunden. Vermutlich Staffel-Paket. Überspringe."
+    echo "[INFO] Kein Episoden-Tag (E??) und kein CD-Split gefunden. Vermutlich Staffel-Paket. Überspringe."
     exit 95
 fi
