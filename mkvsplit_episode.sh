@@ -23,11 +23,44 @@
 # Sonarr API key (Settings -> General -> Security).
 #SonarrApiKey=
 
+# Which series may be touched, and which seasons to assume are split when
+# Sonarr cannot be reached.
+#
+# Format: <name fragment>:<seasons>, several entries separated by ";"
+#   seasons   1,2,3   only these seasons (fallback)
+#             *       every season (fallback)
+#             -       never without Sonarr
+#   The name fragment is matched case-insensitively against the NZB name;
+#   dots are literal characters, not wildcards.
+#
+# Examples: Der.Bergdoktor:16,17
+#           Der.Bergdoktor:-;Die.Rosenheim-Cops:3
+#
+#SplitSeasons=Der.Bergdoktor:16
+
+# Manual exceptions, they override Sonarr.
+# Format: <scene tag>=<ep1>+<ep2>, several entries separated by ";"
+# Example: S16E03=05+06;S17E01=01+02
+#EpisodeOverride=
+
 # Dry run: only log what would happen, change nothing (yes, no).
 #DryRun=yes
 
 # split = cut into two files, rename = only rename to SxxEyy-Ezz (split, rename).
 #Mode=split
+
+# Ignore MKV files smaller than this (MB) - samples, extras, trailers.
+#MinSizeMB=200
+
+# Look for the episode boundary within +/- this many minutes around the middle.
+#SearchWindowMin=6
+
+# Refuse the cut if either half would be shorter than this (minutes).
+#MinPartMin=20
+
+# Hard safety brake: never touch a file shorter than this (minutes).
+# A single episode must never be split, no matter what Sonarr says.
+#MinDoubleMin=70
 
 ### NZBGET POST-PROCESSING SCRIPT                                           ###
 ##############################################################################
@@ -37,37 +70,126 @@ FINAL_NAME="$NZBPP_NZBNAME"
 
 # --- Konfiguration ----------------------------------------------------------
 
+# Positive Ganzzahl aus einer NZBGet-Option lesen, sonst Default.
+num_opt() {
+    local value="$1" fallback="$2" name="$3"
+    if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ]; then
+        printf '%s' "$value"
+    else
+        [ -n "$value" ] && echo "[WARN] Option $name='$value' ist keine positive Zahl - nutze $fallback." >&2
+        printf '%s' "$fallback"
+    fi
+}
+
 SONARR_URL="${NZBPO_SONARRURL:-}"
 SONARR_API_KEY="${NZBPO_SONARRAPIKEY:-}"
 
 # split  = Datei zerschneiden -> zwei Dateien S16E05 / S16E06
 # rename = nur umbenennen zu S16E05-E06 (Sonarr/Plex erkennen Doppelfolgen nativ)
-MODE="${NZBPO_MODE:-split}"
+MODE=$(printf '%s' "${NZBPO_MODE:-split}" | tr '[:upper:]' '[:lower:]')
+if [ "$MODE" != "split" ] && [ "$MODE" != "rename" ]; then
+    echo "[WARN] Option Mode='$MODE' unbekannt - nutze split." >&2
+    MODE="split"
+fi
 
 # yes = nichts anfassen, nur den erkannten Schnittpunkt loggen.
 # Erst nach einem erfolgreichen Testlauf auf "no" setzen!
-DRY_RUN="${NZBPO_DRYRUN:-yes}"
+# Alles außer einem eindeutigen "no" gilt als Trockenlauf - ein Tippfehler
+# darf nicht dazu führen, dass scharf geschnitten wird.
+case "$(printf '%s' "${NZBPO_DRYRUN:-yes}" | tr '[:upper:]' '[:lower:]')" in
+    no|false|0) DRY_RUN="no"  ;;
+    *)          DRY_RUN="yes" ;;
+esac
 
-# Welche Serien überhaupt angefasst werden dürfen.
-# Key   = Teilstring des Paketnamens (case-insensitive, Punkte sind normale Zeichen)
-# Value = Notfall-Staffelliste, falls Sonarr nicht erreichbar ist. Mit
-#         funktionierender Sonarr-Abfrage wird dieser Wert ignoriert.
-declare -A SPLIT_SEASONS=(
-    ["Der.Bergdoktor"]="16"
-)
+# Welche Serien angefasst werden dürfen und welche Staffeln ohne Sonarr als
+# Doppelfolgen-Staffeln gelten. Siehe OPTIONS-Block oben für das Format.
+# Der Wert hier ist nur der Default, wenn die NZBGet-Option leer ist.
+SPLIT_SEASONS="${NZBPO_SPLITSEASONS:-Der.Bergdoktor:16}"
 
-# Manuelle Ausnahmen. Schlagen alles andere, auch Sonarr.
-declare -A EPISODE_OVERRIDE=(
-    # ["S16E03"]="05 06"
-)
+# Manuelle Ausnahmen, schlagen alles andere - auch Sonarr.
+EPISODE_OVERRIDE="${NZBPO_EPISODEOVERRIDE:-}"
 
-MIN_SIZE_MB=200        # kleinere MKVs gelten als Sample/Extra
-SEARCH_WINDOW_MIN=6    # +/- Minuten um die Mitte, in denen gesucht wird
-MIN_PART_MIN=20        # Plausibilitätsgrenze pro Teil nach dem Schnitt
+# kleinere MKVs gelten als Sample/Extra
+MIN_SIZE_MB=$(num_opt "${NZBPO_MINSIZEMB:-}" 200 MinSizeMB)
+
+# +/- Minuten um die Mitte, in denen der Schnittpunkt gesucht wird
+SEARCH_WINDOW_MIN=$(num_opt "${NZBPO_SEARCHWINDOWMIN:-}" 6 SearchWindowMin)
+
+# Plausibilitätsgrenze pro Teil nach dem Schnitt
+MIN_PART_MIN=$(num_opt "${NZBPO_MINPARTMIN:-}" 20 MinPartMin)
 
 # Harte Bremse: Kürzer als das kann keine Doppelfolge sein. Greift auch dann,
 # wenn Sonarr etwas anderes behauptet oder die Staffelliste falsch ist.
-MIN_DOUBLE_MIN=70
+MIN_DOUBLE_MIN=$(num_opt "${NZBPO_MINDOUBLEMIN:-}" 70 MinDoubleMin)
+
+# --- Konfiguration auswerten ------------------------------------------------
+
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# Sucht den ersten Eintrag, dessen Namensfragment im Paketnamen vorkommt.
+# Gibt dessen Staffelliste aus. Rückgabe 1 = keine Serie passt.
+match_series_seasons() {
+    local cfg="$1" name="$2" entry pat seasons hit=1
+    shopt -s nocasematch
+    while IFS= read -r entry; do
+        entry=$(trim "$entry")
+        [ -z "$entry" ] && continue
+        if [[ "$entry" == *:* ]]; then
+            pat=$(trim "${entry%%:*}")
+            seasons=$(trim "${entry#*:}")
+        else
+            pat="$entry"
+            seasons="*"
+        fi
+        [ -z "$pat" ] && continue
+        if [[ "$name" == *"$pat"* ]]; then
+            printf '%s' "$seasons"
+            hit=0
+            break
+        fi
+    done < <(printf '%s\n' "$cfg" | tr ';' '\n')
+    shopt -u nocasematch
+    return "$hit"
+}
+
+# Steht die Staffel in der Liste? "*" = alle, "-" oder leer = keine.
+season_allowed() {
+    local list="$1" want="$2" s
+    [ "$list" = "*" ] && return 0
+    [ -z "$list" ] && return 1
+    [ "$list" = "-" ] && return 1
+    for s in ${list//,/ }; do
+        [[ "$s" =~ ^[0-9]+$ ]] || continue
+        [ "$(( 10#$s ))" -eq "$(( 10#$want ))" ] && return 0
+    done
+    return 1
+}
+
+# Sucht "S16E03=05+06" und gibt "05 06" aus. Rückgabe 1 = kein Eintrag.
+lookup_override() {
+    local cfg="$1" want="$2" entry k v hit=1
+    want=$(printf '%s' "$want" | tr '[:lower:]' '[:upper:]')
+    while IFS= read -r entry; do
+        entry=$(trim "$entry")
+        [ -z "$entry" ] && continue
+        [[ "$entry" == *=* ]] || continue
+        k=$(trim "${entry%%=*}")
+        k=$(printf '%s' "$k" | tr '[:lower:]' '[:upper:]')
+        [ "$k" = "$want" ] || continue
+        v=$(trim "${entry#*=}")
+        v="${v//+/ }"
+        v="${v//,/ }"
+        printf '%s' "$v"
+        hit=0
+        break
+    done < <(printf '%s\n' "$cfg" | tr ';' '\n')
+    return "$hit"
+}
 
 # --- Hilfsfunktionen --------------------------------------------------------
 
@@ -140,18 +262,8 @@ fi
 cd "$TARGET_DIR" || exit 94
 
 # 1. Ist das eine konfigurierte Serie?
-shopt -s nocasematch
-fallback_seasons=""
-for p in "${!SPLIT_SEASONS[@]}"; do
-    if [[ "$FINAL_NAME" == *"$p"* ]]; then
-        fallback_seasons="${SPLIT_SEASONS[$p]}"
-        break
-    fi
-done
-shopt -u nocasematch
-
-if [ -z "$fallback_seasons" ]; then
-    echo "[INFO] '$FINAL_NAME' steht nicht auf der Doppelfolgen-Liste. Überspringe."
+if ! fallback_seasons=$(match_series_seasons "$SPLIT_SEASONS" "$FINAL_NAME"); then
+    echo "[INFO] '$FINAL_NAME' steht nicht in SplitSeasons ($SPLIT_SEASONS). Überspringe."
     exit 95
 fi
 
@@ -168,8 +280,14 @@ key=$(printf 'S%sE%s' "$season" "$scene_ep")
 # 3. Mapping bestimmen: Override -> Sonarr -> statische Liste
 ep1=""; ep2=""; source_of_truth=""
 
-if [ -n "${EPISODE_OVERRIDE[$key]}" ]; then
-    read -r ep1 ep2 <<< "${EPISODE_OVERRIDE[$key]}"
+if override=$(lookup_override "$EPISODE_OVERRIDE" "$key"); then
+    read -r ep1 ep2 <<< "$override"
+    if [ -z "$ep2" ]; then
+        echo "[ERROR] EpisodeOverride für $key braucht zwei Folgen (z.B. $key=05+06)."
+        exit 94
+    fi
+    ep1=$(printf '%02d' "$(( 10#$ep1 ))")
+    ep2=$(printf '%02d' "$(( 10#$ep2 ))")
     source_of_truth="manuelles Override"
 fi
 
@@ -221,18 +339,19 @@ if [ -z "$ep1" ] && [ -n "$SONARR_URL" ] && [ -n "$SONARR_API_KEY" ]; then
 fi
 
 if [ -z "$ep1" ]; then
-    in_list=0
-    for s in $fallback_seasons; do
-        [ "$(( 10#$s ))" -eq "$(( 10#$season ))" ] && { in_list=1; break; }
-    done
-    if [ "$in_list" -ne 1 ]; then
+    if ! season_allowed "$fallback_seasons" "$season"; then
         echo "[INFO] Ohne Sonarr-Auskunft und Staffel $season steht nicht in der"
-        echo "       Notfall-Liste ($fallback_seasons). Überspringe."
+        echo "       Notfall-Liste ('$fallback_seasons'). Überspringe."
         exit 95
     fi
     ep1=$(printf '%02d' $(( 10#$scene_ep * 2 - 1 )))
     ep2=$(printf '%02d' $(( 10#$scene_ep * 2 )))
     source_of_truth="Notfall-Liste + 2N-1/2N-Regel"
+fi
+
+if [ "$ep1" = "$ep2" ]; then
+    echo "[ERROR] Mapping liefert zweimal Folge E${ep1}. Breche ab."
+    exit 94
 fi
 
 name1="${FINAL_NAME/$tag/S${season}E${ep1}}"
@@ -272,6 +391,10 @@ fi
 
 # 6. Nur umbenennen?
 if [ "$MODE" = "rename" ]; then
+    if [ "$src" = "${name_both}.mkv" ]; then
+        echo "[INFO] '$src' heißt bereits richtig. Nichts zu tun."
+        exit 95
+    fi
     echo "[INFO] Umbenennen: '$src' -> '${name_both}.mkv'"
     if [ "$DRY_RUN" = "yes" ]; then
         echo "[INFO] DRY_RUN aktiv - nichts geändert."
@@ -376,9 +499,23 @@ if [ ! -s "${tmp}/part-001.mkv" ] || [ ! -s "${tmp}/part-002.mkv" ]; then
     exit 94
 fi
 
-mv -- "${tmp}/part-001.mkv" "${name1}.mkv" || exit 94
-mv -- "${tmp}/part-002.mkv" "${name2}.mkv" || exit 94
-rm -- "$src"
+# Das Original erst beiseiteschieben: einer der Zielnamen kann mit der
+# Quelldatei identisch sein (z.B. Override S12E03=03+04).
+backup="${src}.orig"
+mv -- "$src" "$backup" || exit 94
+
+if ! mv -- "${tmp}/part-001.mkv" "${name1}.mkv"; then
+    echo "[ERROR] Konnte Teil 1 nicht ablegen. Stelle Original wieder her."
+    mv -- "$backup" "$src"
+    exit 94
+fi
+if ! mv -- "${tmp}/part-002.mkv" "${name2}.mkv"; then
+    echo "[ERROR] Konnte Teil 2 nicht ablegen. Stelle Original wieder her."
+    rm -f -- "${name1}.mkv"
+    mv -- "$backup" "$src"
+    exit 94
+fi
+rm -- "$backup"
 
 echo "[INFO] Fertig: ${name1}.mkv + ${name2}.mkv"
 exit 93
