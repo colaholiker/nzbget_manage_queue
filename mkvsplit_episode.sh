@@ -325,6 +325,12 @@ if [ -z "$ep1" ] && [ -n "$SONARR_URL" ] && [ -n "$SONARR_API_KEY" ]; then
                     2)
                         ep1=$(printf '%02d' "$1")
                         ep2=$(printf '%02d' "$2")
+                        if [ "$(( 10#$ep2 ))" -ne "$(( 10#$ep1 + 1 ))" ]; then
+                            echo "[WARN] Sonarr liefert E$ep1 + E$ep2 - nicht aufeinanderfolgend."
+                            echo "       Die TVDB-Sendedaten dieser Staffel sind unstimmig."
+                            echo "       Überspringe, sonst landet der falsche Inhalt in der Folge."
+                            exit 95
+                        fi
                         source_of_truth="Sonarr (Sendedatum-Gruppierung)"
                         ;;
                     *)

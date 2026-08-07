@@ -91,8 +91,12 @@ if [ -z "$episodes" ]; then
     exit 1
 fi
 
-# Namensfragment für die NZBGet-Option SplitSeasons
-name_fragment=$(printf '%s' "$series_title" | tr ' ' '.')
+# Namensfragment für die NZBGet-Option SplitSeasons.
+# Sonarr hängt bei mehrdeutigen Titeln das Jahr an ("Der Bergdoktor (2008)"),
+# im Release-Namen steht das aber nicht - also abschneiden.
+name_fragment=$(printf '%s' "$series_title" \
+                | sed -E 's/[[:space:]]*\([0-9]{4}\)[[:space:]]*$//' \
+                | tr ' ' '.')
 
 # --- Auswerten --------------------------------------------------------------
 
@@ -143,7 +147,7 @@ printf '%s\n' "$episodes" \
                 continue
             }
 
-            split_list = split_list (split_list == "" ? "" : ",") s
+            uniform = 1
 
             if (!csv)
                 printf "\nStaffel %02d   %2d Folgen / %2d Sendetermine   ->  MAPPING NÖTIG\n", \
@@ -165,19 +169,49 @@ printf '%s\n' "$episodes" \
                     line = line sprintf(" S%02dE%02d%s", s, e[x], (x < m ? " +" : ""))
 
                 flag = ""
-                if (cnt != 2) { flag = sprintf("   [!! %d Folgen an einem Termin]", cnt); warned++ }
+                if (cnt == 1) {
+                    flag = "   [1:1, kein Split]"
+                    uniform = 0
+                } else if (cnt > 2) {
+                    flag = sprintf("   [!! %d Folgen an einem Termin - fuer XEM unbrauchbar]", cnt)
+                    uniform = 0
+                    warned++
+                } else {
+                    # Nicht aufeinanderfolgende Nummern = unstimmige TVDB-Sendedaten
+                    for (x = 2; x <= m; x++)
+                        if (e[x] != e[x-1] + 1) {
+                            flag = "   [!! Nummern nicht zusammenhaengend - TVDB-Daten pruefen]"
+                            broken[s] = 1
+                            uniform = 0
+                            warned++
+                        }
+                }
                 printf "%-46s  %s  %s%s\n", line, date[k], name[k], flag
             }
+
+            # Nur gleichmaessig verdoppelte Staffeln taugen fuer die
+            # 2N-1/2N-Notfallregel im Split-Skript.
+            if (uniform) split_list = split_list (split_list == "" ? "" : ",") s
+            else         mixed = mixed (mixed == "" ? "" : ",") s
         }
 
         if (!csv) {
             printf "\n--- Fuer NZBGet ---\n"
             if (split_list == "")
-                printf "SplitSeasons=%s:-      (keine Staffel braucht einen Split)\n", frag
+                printf "SplitSeasons=%s:-      (keine gleichmaessig verdoppelte Staffel)\n", frag
             else
                 printf "SplitSeasons=%s:%s\n", frag, split_list
-            if (warned)
-                printf "\n[!] %d Sendetermin(e) mit ungleich 2 Folgen - die Zeilen oben pruefen.\n", warned
+            if (mixed != "")
+                printf "Staffel %s bewusst nicht in der Liste: gemischt oder unstimmig,\n" \
+                       "dort funktioniert die 2N-1/2N-Notfallregel nicht. Nur mit Sonarr splitten.\n", mixed
+            if (warned) {
+                printf "\n[!] %d Sendetermin(e) sind fuer ein XEM-Mapping unbrauchbar.\n", warned
+                bad = ""
+                for (i = 1; i <= nseasons; i++)
+                    if (broken[order[i]]) bad = bad (bad == "" ? "" : ", ") order[i]
+                if (bad != "")
+                    printf "    Staffel %s hat unstimmige TVDB-Sendedaten - dort weder mappen noch splitten.\n", bad
+            }
             printf "\nMaschinenlesbar (season,scene_ep,tvdb_ep): nochmal mit --csv aufrufen.\n"
         }
     }'
