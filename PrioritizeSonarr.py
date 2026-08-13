@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 #
-# Prioritize the Sonarr series with the fewest episodes in the download queue.
+# Prioritize one Sonarr series in the download queue (shortest one by default).
 #
 ##############################################################################
 ### NZBGET QUEUE SCRIPT                                                    ###
 
-# Prioritize the shortest Sonarr series currently downloading.
+# Prioritize one of the Sonarr series currently downloading (shortest first).
 #
 # On a queue event this script asks Sonarr which series the queued downloads
-# belong to, then prioritizes the download(s) of the series that has the
-# fewest episodes in total (the "shortest" series), so it finishes first.
+# belong to, then prioritizes the download(s) of the series that comes first in
+# the configured sort order (by default the series with the fewest episodes in
+# total, the "shortest" one), so it finishes first.
 #
 # Series carrying a configurable Sonarr tag (default: nop) are ignored and
 # never prioritized.
@@ -45,9 +46,26 @@
 # Move the prioritized downloads to the top of the queue (yes, no).
 #MoveToTop=no
 
+# Order in which the target series is picked (comma separated keys).
+#
+# The first key decides, the following ones break ties. Prefix a key with "-"
+# to reverse it (biggest/last first). Known keys:
+#   episodes  - number of episodes the series has in total;
+#   remaining - MB the series still has to download;
+#   size      - total MB of the series' queued downloads;
+#   downloads - number of queued downloads of the series;
+#   year      - year the series started;
+#   title     - series title (see IgnoreLeadingArticles).
+#
+# Examples: episodes, title       - shortest series first (default);
+#           remaining, title      - series closest to being finished first;
+#           -year, episodes       - newest series first;
+#           -size, title          - biggest download first.
+#SortOrder=episodes, title
+
 # Ignore leading articles when sorting series alphabetically (yes, no).
 #
-# When ties are broken alphabetically, a leading article is stripped first, so
+# When series are sorted by title, a leading article is stripped first, so
 # "The Boys" sorts under B and "Der Tatortreiniger" under T.
 #IgnoreLeadingArticles=yes
 
@@ -171,6 +189,63 @@ def sort_title(text, articles):
     if match and match.group(1) in articles:
         return match.group(2)
     return title
+
+
+# Sort keys usable in the SortOrder option, mapped to the candidate field they
+# read (keep in sync with the #SortOrder documentation above).
+SORT_KEYS = {
+    "episodes": "total",
+    "remaining": "remaining",
+    "size": "size",
+    "downloads": "downloads",
+    "year": "year",
+    "title": "sortname",
+}
+
+# Default order: shortest series first, ties broken alphabetically (keep in
+# sync with the #SortOrder default documented in the OPTIONS section above).
+DEFAULT_SORT_ORDER = "episodes, title"
+
+
+def parse_sort_order(raw):
+    """Parse SortOrder into a list of (key, reverse) pairs.
+
+    Unknown keys are dropped with a warning; if nothing usable is left the
+    default order is used.
+    """
+    keys = []
+    for token in parse_list(raw):
+        reverse = token.startswith("-")
+        name = token.lstrip("+-").strip().lower()
+        if name not in SORT_KEYS:
+            log_warning("Unknown SortOrder key '%s' - ignoring it." % token)
+            continue
+        keys.append((name, reverse))
+    if not keys:
+        if raw.strip():
+            log_warning("No usable SortOrder key in '%s', using '%s'." % (raw, DEFAULT_SORT_ORDER))
+        return [(name, False) for name in parse_list(DEFAULT_SORT_ORDER)]
+    return keys
+
+
+def describe_sort_order(sort_keys):
+    """Render the parsed sort order the way it is written in the option."""
+    return ", ".join(("-" if reverse else "") + name for name, reverse in sort_keys)
+
+
+def sort_candidates(candidates, sort_keys):
+    """Return the candidate ids ordered by the configured sort keys.
+
+    Sorting runs once per key from the least to the most significant one; since
+    Python's sort is stable that yields the same result as one combined key,
+    but it also allows reversing individual keys (which negating cannot do for
+    titles).
+    """
+    ordered = list(candidates)
+    for name, reverse in reversed(sort_keys):
+        field = SORT_KEYS[name]
+        ordered.sort(key=lambda sid, f=field: candidates[sid][f], reverse=reverse)
+    return ordered
 
 
 # --------------------------------------------------------------------------
@@ -335,9 +410,9 @@ def set_priority(name, nzbid, current_priority, priority, move_to_top):
     log_info("'%s' priority set to %s." % (name, priority))
 
 
-def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb,
-                               sort_articles, max_prioritized):
-    """Prioritize the downloads of the queued Sonarr series with fewest episodes."""
+def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb,
+                             sort_articles, sort_keys, max_prioritized):
+    """Prioritize the downloads of the first queued Sonarr series in sort order."""
     try:
         series_list = sonarr_request(base_url, api_key, "/series")
         tags = sonarr_request(base_url, api_key, "/tag")
@@ -391,10 +466,15 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
                            % (name, series.get("title", "?"), exclude_tag))
                 continue
 
+        title = series.get("title", "?")
         entry = candidates.setdefault(series_id, {
-            "title": series.get("title", "?"),
+            "title": title,
+            "sortname": sort_title(title, sort_articles),
             "total": series_total_episodes(series),
+            "year": to_int(series.get("year"), 0),
             "remaining": 0,
+            "size": 0,
+            "downloads": 0,
             "groups": [],
         })
         # Ignore paused parts (e.g. par2 files NZBGet only fetches on demand);
@@ -403,6 +483,8 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
         paused_mb = to_int(group.get("PausedSizeMB"), 0)
         active_mb = max(0, remaining_mb - paused_mb)
         entry["remaining"] += active_mb
+        entry["size"] += to_int(group.get("FileSizeMB"), 0)
+        entry["downloads"] += 1
         entry["groups"].append((to_int(nzbid, -1), name, get_group_priority(group)))
         log_detail("'%s' -> series '%s': %d MB to download (%d MB total, %d MB paused)."
                    % (name, entry["title"], active_mb, remaining_mb, paused_mb))
@@ -411,8 +493,11 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
         log_detail("No queued download could be matched to an eligible Sonarr series.")
         return
 
-    # Order eligible series by fewest episodes, ties broken alphabetically by title.
-    ordered = sorted(candidates, key=lambda sid: (candidates[sid]["total"], sort_title(candidates[sid]["title"], sort_articles)))
+    # Order the eligible series by the configured SortOrder.
+    ordered = sort_candidates(candidates, sort_keys)
+    log_detail("Series by SortOrder (%s): %s."
+               % (describe_sort_order(sort_keys),
+                  ", ".join("'%s'" % candidates[sid]["title"] for sid in ordered)))
 
     # A series with 0 MB to fetch (everything paused) gains nothing from a
     # boost: it is neither the target nor almost finished, it is just idle.
@@ -430,7 +515,7 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
         almost_done = []
     almost_done_set = set(almost_done)
 
-    # The target: the shortest series that still has real work left.
+    # The target: the first series in sort order that still has real work left.
     winner_id = next((sid for sid in ordered if has_work(sid) and sid not in almost_done_set), None)
 
     # Keep the boost on a bounded set of series - the target plus as many
@@ -490,7 +575,7 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
 # --------------------------------------------------------------------------
 
 def handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb, sort_articles,
-                 max_prioritized):
+                 sort_keys, max_prioritized):
     """QUEUE context: react to a queue event."""
     event = os.environ.get("NZBNA_EVENT", "")
     wanted = [e.upper() for e in parse_list(get_option("QueueEvents", "NZB_ADDED, URL_COMPLETED"))]
@@ -498,8 +583,8 @@ def handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_rema
         log_detail("Ignoring queue event '%s' (not in QueueEvents)." % event)
         return SUCCESS
 
-    prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb,
-                               sort_articles, max_prioritized)
+    prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb,
+                             sort_articles, sort_keys, max_prioritized)
     return SUCCESS
 
 
@@ -536,9 +621,11 @@ def main():
     else:
         sort_articles = set()
 
+    sort_keys = parse_sort_order(get_option("SortOrder", DEFAULT_SORT_ORDER))
+
     if "NZBNA_EVENT" in os.environ:
         return handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb,
-                            sort_articles, max_prioritized)
+                            sort_articles, sort_keys, max_prioritized)
 
     log_error("Unknown context: queue variables (NZBNA_) not set. This is a QUEUE script.")
     return ERROR
