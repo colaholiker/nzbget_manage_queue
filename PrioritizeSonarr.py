@@ -30,6 +30,19 @@
 # Sonarr API key (Sonarr: Settings -> General -> Security).
 #SonarrApiKey=
 
+# Seconds to wait for a single Sonarr/NZBGet request (minimum 1).
+#
+# Queue scripts run synchronously: while this script waits for a socket,
+# NZBGet's queue stands still. Keep this short so an unreachable Sonarr does
+# not look like a frozen NZBGet.
+#RequestTimeout=10
+
+# Seconds this script may spend in total before it gives up (0 = no limit).
+#
+# Upper bound for how long NZBGet can be blocked by this script, across all
+# requests. When the budget runs out the queue is left as it is.
+#TotalTimeout=30
+
 # Ignore series carrying this Sonarr tag (leave empty to disable).
 #
 # Series tagged with this label are never prioritized. Case-insensitive.
@@ -88,6 +101,8 @@ import json
 import os
 import re
 import sys
+import time
+import urllib.error
 import urllib.request
 
 # NZBGet exit codes for queue scripts.
@@ -109,6 +124,11 @@ DEFAULT_MAX_PRIORITIZED = "3"
 # processing, par-repair, unpacking, ...) has already been downloaded, so its
 # priority is meaningless and it must not be mistaken for "almost finished".
 ACTIVE_STATUSES = ("QUEUED", "PAUSED", "DOWNLOADING", "FETCHING")
+
+# Default socket and overall timeouts (keep in sync with the #RequestTimeout
+# and #TotalTimeout defaults documented in the OPTIONS section above).
+DEFAULT_REQUEST_TIMEOUT = "10"
+DEFAULT_TOTAL_TIMEOUT = "30"
 
 
 def log_info(message):
@@ -174,6 +194,56 @@ def sort_title(text, articles):
 
 
 # --------------------------------------------------------------------------
+# Time budget
+# --------------------------------------------------------------------------
+#
+# NZBGet calls queue scripts synchronously - it waits for us before it carries
+# on with the queue. Every second spent waiting for a socket therefore looks
+# like a hung NZBGet, and an unreachable Sonarr used to block it for a full
+# minute per request. Every request is capped individually and all of them
+# together, so the worst case is bounded no matter what fails.
+
+_request_timeout = to_int(DEFAULT_REQUEST_TIMEOUT)
+_total_timeout = 0
+_deadline = None
+
+
+class TimeBudgetExceeded(Exception):
+    """Raised when the script has used up its total time budget."""
+
+
+def start_time_budget(request_timeout, total_timeout):
+    """Arm the per-request timeout and the overall deadline."""
+    global _request_timeout, _total_timeout, _deadline
+    _request_timeout = max(1, request_timeout)
+    _total_timeout = max(0, total_timeout)
+    _deadline = time.monotonic() + _total_timeout if _total_timeout > 0 else None
+
+
+def next_timeout():
+    """Timeout for the next request, capped by what is left of the budget."""
+    if _deadline is None:
+        return _request_timeout
+    left = _deadline - time.monotonic()
+    if left <= 0:
+        raise TimeBudgetExceeded(
+            "TotalTimeout of %d second(s) is used up" % _total_timeout)
+    return min(_request_timeout, left)
+
+
+def is_unreachable(exc):
+    """True if the error means the other side never answered.
+
+    Timeouts, refused connections and DNS failures are all fatal for this run:
+    repeating the call would only block NZBGet twice as long. HTTPError is a
+    URLError, but it means we did get an answer, so it is not counted here.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    return isinstance(exc, (OSError, TimeBudgetExceeded))
+
+
+# --------------------------------------------------------------------------
 # NZBGet JSON-RPC
 # --------------------------------------------------------------------------
 
@@ -196,19 +266,37 @@ def rpc_call(method, params):
         token = base64.b64encode(("%s:%s" % (username, password)).encode("utf-8")).decode("ascii")
         request.add_header("Authorization", "Basic " + token)
 
-    with urllib.request.urlopen(request, timeout=60) as response:
+    with urllib.request.urlopen(request, timeout=next_timeout()) as response:
         payload = json.loads(response.read().decode("utf-8"))
     if payload.get("error"):
         raise RuntimeError(payload["error"])
     return payload.get("result")
 
 
+# Set once we know this NZBGet only accepts the legacy editqueue signature, so
+# the probe below is paid at most once per run.
+_editqueue_legacy = False
+
+
 def editqueue(command, param, ids):
-    """Run editqueue, trying the modern 3-arg signature then the legacy 4-arg one."""
+    """Run editqueue, trying the modern 3-arg signature then the legacy 4-arg one.
+
+    The fallback is only taken when NZBGet actually answered and rejected the
+    call. After a timeout or a refused connection a second attempt would just
+    double the time NZBGet is blocked by this script.
+    """
+    global _editqueue_legacy
+
+    if _editqueue_legacy:
+        return rpc_call("editqueue", [command, 0, str(param), ids])
     try:
         return rpc_call("editqueue", [command, str(param), ids])
-    except Exception:  # noqa: BLE001 - fall back to the older signature
-        return rpc_call("editqueue", [command, 0, str(param), ids])
+    except Exception as exc:  # noqa: BLE001 - maybe just the wrong signature
+        if is_unreachable(exc):
+            raise
+    result = rpc_call("editqueue", [command, 0, str(param), ids])
+    _editqueue_legacy = True
+    return result
 
 
 def get_group_priority(group):
@@ -241,7 +329,7 @@ def sonarr_request(base_url, api_key, path):
     request = urllib.request.Request(url)
     request.add_header("X-Api-Key", api_key)
     request.add_header("Accept", "application/json")
-    with urllib.request.urlopen(request, timeout=60) as response:
+    with urllib.request.urlopen(request, timeout=next_timeout()) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -329,6 +417,8 @@ def set_priority(name, nzbid, current_priority, priority, move_to_top):
         editqueue("GroupSetPriority", priority, [nzbid])
         if move_to_top:
             editqueue("GroupMoveTop", 0, [nzbid])
+    except TimeBudgetExceeded:
+        raise  # out of time - stop instead of blocking NZBGet any longer
     except Exception as exc:  # noqa: BLE001
         log_warning("Could not update queue entry '%s': %s" % (name, exc))
         return
@@ -342,8 +432,11 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
         series_list = sonarr_request(base_url, api_key, "/series")
         tags = sonarr_request(base_url, api_key, "/tag")
         queue_records = sonarr_queue_records(base_url, api_key)
+    except TimeBudgetExceeded:
+        raise
     except Exception as exc:  # noqa: BLE001
-        log_warning("Could not query Sonarr: %s" % exc)
+        log_warning("Could not query Sonarr at %s: %s - leaving the queue as it is."
+                    % (base_url.rstrip("/"), exc))
         return
 
     exclude_tag_id = tag_id_for_label(tags, exclude_tag) if exclude_tag else None
@@ -354,6 +447,8 @@ def prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to
 
     try:
         groups = rpc_call("listgroups", [0])
+    except TimeBudgetExceeded:
+        raise
     except Exception as exc:  # noqa: BLE001
         log_warning("Could not read the NZBGet queue via RPC: %s" % exc)
         return
@@ -498,8 +593,13 @@ def handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_rema
         log_detail("Ignoring queue event '%s' (not in QueueEvents)." % event)
         return SUCCESS
 
-    prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb,
-                               sort_articles, max_prioritized)
+    try:
+        prioritize_shortest_series(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb,
+                                   sort_articles, max_prioritized)
+    except TimeBudgetExceeded as exc:
+        # Not an error: nothing is broken, we just refuse to keep NZBGet
+        # waiting. The next queue event tries again.
+        log_warning("%s - giving up to keep the queue moving." % exc)
     return SUCCESS
 
 
@@ -514,6 +614,13 @@ def main():
     if not base_url or not api_key:
         log_error("SonarrUrl and SonarrApiKey must be configured.")
         return ERROR
+
+    start_time_budget(
+        to_int(get_option("RequestTimeout", DEFAULT_REQUEST_TIMEOUT).strip(),
+               to_int(DEFAULT_REQUEST_TIMEOUT)),
+        to_int(get_option("TotalTimeout", DEFAULT_TOTAL_TIMEOUT).strip(),
+               to_int(DEFAULT_TOTAL_TIMEOUT)),
+    )
 
     exclude_tag = get_option("ExcludeTag", "nop").strip()
 
