@@ -105,7 +105,7 @@ import time
 import urllib.error
 import urllib.request
 
-# NZBGet exit codes for queue scripts.
+#  NZBGet exit codes for queue scripts.
 SUCCESS = 93
 ERROR = 94
 
