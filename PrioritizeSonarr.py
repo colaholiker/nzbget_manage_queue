@@ -101,6 +101,15 @@
 # Everything else is reset to normal priority. Set to 0 for no limit.
 #MaxPrioritizedSeries=3
 
+# Maximum number of downloads kept on the boost priority at the same time.
+#
+# MaxPrioritizedSeries counts series, not downloads - a single series with a
+# whole season queued can still put the boost on dozens of entries. This is the
+# hard cap on the individual queue entries: the target series' downloads are
+# filled in first (in queue order), then those of the almost finished series.
+# Downloads beyond the cap are reset to normal priority. Set to 0 for no limit.
+#MaxPrioritizedDownloads=0
+
 # Queue events to react to (comma separated).
 #
 # Possible events:
@@ -137,6 +146,10 @@ NORMAL_PRIORITY = "0"
 # Default limit of simultaneously prioritized series (keep in sync with the
 # #MaxPrioritizedSeries default documented in the OPTIONS section above).
 DEFAULT_MAX_PRIORITIZED = "3"
+
+# Default limit of simultaneously prioritized downloads, 0 = no limit (keep in
+# sync with the #MaxPrioritizedDownloads default documented above).
+DEFAULT_MAX_PRIORITIZED_DOWNLOADS = "0"
 
 # Group statuses that still compete for bandwidth. Everything else (post-
 # processing, par-repair, unpacking, ...) has already been downloaded, so its
@@ -501,7 +514,7 @@ def set_priority(name, nzbid, current_priority, priority, move_to_top):
 
 
 def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb,
-                             sort_articles, sort_keys, max_prioritized):
+                             sort_articles, sort_keys, max_prioritized, max_downloads):
     """Prioritize the downloads of the first queued Sonarr series in sort order."""
     try:
         series_list = sonarr_request(base_url, api_key, "/series")
@@ -619,7 +632,6 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
     prioritized = [winner_id] if winner_id is not None else []
     room = len(almost_done) if max_prioritized <= 0 else max(0, max_prioritized - len(prioritized))
     prioritized.extend(almost_done[:room])
-    prioritized_set = set(prioritized)
 
     dropped = almost_done[room:]
     if dropped:
@@ -627,37 +639,51 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
                    % (max_prioritized, len(dropped),
                       ", ".join("'%s'" % candidates[sid]["title"] for sid in dropped)))
 
+    # Flatten the boosted series into the individual queue entries, target
+    # first. MaxPrioritizedSeries counts series, so a single series with a whole
+    # season queued could still put the boost on the entire queue - this is the
+    # cap on the downloads themselves. Within a series the queue order wins,
+    # which is the order NZBGet would have fetched them in anyway.
+    boosted = [(sid, group) for sid in prioritized for group in candidates[sid]["groups"]]
+    if max_downloads > 0 and len(boosted) > max_downloads:
+        skipped = boosted[max_downloads:]
+        boosted = boosted[:max_downloads]
+        log_detail("MaxPrioritizedDownloads=%d reached - %d download(s) not boosted: %s."
+                   % (max_downloads, len(skipped),
+                      ", ".join("'%s'" % name for _, (_, name, _) in skipped)))
+    boosted_ids = {nzbid for _, (nzbid, _, _) in boosted}
+
     if winner_id is not None:
         winner = candidates[winner_id]
-        log_info("Target series: '%s' (%d episode(s) total, %d MB left) - prioritizing %d download(s)."
-                 % (winner["title"], winner["total"], winner["remaining"], len(winner["groups"])))
-        for nzbid, name, current_priority in winner["groups"]:
-            set_priority(name, nzbid, current_priority, priority, move_to_top)
+        log_info("Target series: '%s' (%d episode(s) total, %d MB left) - prioritizing %d of %d download(s)."
+                 % (winner["title"], winner["total"], winner["remaining"],
+                    sum(1 for sid, _ in boosted if sid == winner_id), len(winner["groups"])))
 
-    # Keep the almost finished series on priority as well (never moved to top).
-    for series_id in prioritized:
-        if series_id == winner_id:
-            continue
-        entry = candidates[series_id]
-        log_detail("Keeping almost finished '%s' (%d MB left) prioritized."
-                   % (entry["title"], entry["remaining"]))
-        for nzbid, name, current_priority in entry["groups"]:
-            set_priority(name, nzbid, current_priority, priority, False)
+    # The target's downloads may be moved to the top; the almost finished
+    # series keep their place in the queue and only get the priority.
+    logged = set()
+    for series_id, (nzbid, name, current_priority) in boosted:
+        if series_id != winner_id and series_id not in logged:
+            logged.add(series_id)
+            log_detail("Keeping almost finished '%s' (%d MB left) prioritized."
+                       % (candidates[series_id]["title"], candidates[series_id]["remaining"]))
+        set_priority(name, nzbid, current_priority, priority, move_to_top and series_id == winner_id)
 
-    if not prioritized:
-        log_detail("No eligible series to prioritize.")
+    if not boosted:
+        log_detail("No eligible download to prioritize.")
 
-    # Reset every other series back to normal. Anything raised above normal up
-    # to the boost is ours to lower - matching the boost exactly missed
-    # leftovers from an earlier MatchPriority and groups reporting a different
-    # value. Priorities above the boost (e.g. a manually forced 900) and
-    # deliberately lowered ones are left alone.
+    # Reset everything else back to normal - including the downloads of a
+    # boosted series that did not fit into MaxPrioritizedDownloads. Anything
+    # raised above normal up to the boost is ours to lower - matching the boost
+    # exactly missed leftovers from an earlier MatchPriority and groups
+    # reporting a different value. Priorities above the boost (e.g. a manually
+    # forced 900) and deliberately lowered ones are left alone.
     boost = to_int(priority)
     normal = to_int(NORMAL_PRIORITY)
-    for series_id, entry in candidates.items():
-        if series_id in prioritized_set:
-            continue
+    for entry in candidates.values():
         for nzbid, name, current_priority in entry["groups"]:
+            if nzbid in boosted_ids:
+                continue
             if normal < current_priority <= boost:
                 set_priority(name, nzbid, current_priority, NORMAL_PRIORITY, False)
             elif current_priority > boost:
@@ -670,7 +696,7 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
 # --------------------------------------------------------------------------
 
 def handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb, sort_articles,
-                 sort_keys, max_prioritized):
+                 sort_keys, max_prioritized, max_downloads):
     """QUEUE context: react to a queue event."""
     event = os.environ.get("NZBNA_EVENT", "")
     wanted = [e.upper() for e in parse_list(get_option("QueueEvents", "NZB_ADDED, URL_COMPLETED"))]
@@ -680,7 +706,7 @@ def handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_rema
 
     try:
         prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb,
-                                 sort_articles, sort_keys, max_prioritized)
+                                 sort_articles, sort_keys, max_prioritized, max_downloads)
     except TimeBudgetExceeded as exc:
         # Not an error: nothing is broken, we just refuse to keep NZBGet
         # waiting. The next queue event tries again.
@@ -722,6 +748,11 @@ def main():
                              to_int(DEFAULT_MAX_PRIORITIZED))
     if max_prioritized < 0:
         max_prioritized = 0
+    max_downloads = to_int(
+        get_option("MaxPrioritizedDownloads", DEFAULT_MAX_PRIORITIZED_DOWNLOADS).strip(),
+        to_int(DEFAULT_MAX_PRIORITIZED_DOWNLOADS))
+    if max_downloads < 0:
+        max_downloads = 0
 
     if get_bool_option("IgnoreLeadingArticles", True):
         sort_articles = {a.lower() for a in parse_list(get_option("SortArticles", DEFAULT_SORT_ARTICLES))}
@@ -732,7 +763,7 @@ def main():
 
     if "NZBNA_EVENT" in os.environ:
         return handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb,
-                            sort_articles, sort_keys, max_prioritized)
+                            sort_articles, sort_keys, max_prioritized, max_downloads)
 
     log_error("Unknown context: queue variables (NZBNA_) not set. This is a QUEUE script.")
     return ERROR
