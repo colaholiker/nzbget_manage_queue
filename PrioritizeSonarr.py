@@ -106,7 +106,9 @@
 # MaxPrioritizedSeries counts series, not downloads - a single series with a
 # whole season queued can still put the boost on dozens of entries. This is the
 # hard cap on the individual queue entries: the target series' downloads are
-# filled in first (in queue order), then those of the almost finished series.
+# filled in first, then those of the almost finished series. Within a series
+# the oldest queue entries (lowest NZBID) win, so the same downloads keep the
+# boost until they are done instead of it jumping around on every queue event.
 # Downloads beyond the cap are reset to normal priority. Set to 0 for no limit.
 #MaxPrioritizedDownloads=0
 
@@ -264,6 +266,21 @@ def parse_sort_order(raw):
 def describe_sort_order(sort_keys):
     """Render the parsed sort order the way it is written in the option."""
     return ", ".join(("-" if reverse else "") + name for name, reverse in sort_keys)
+
+
+# How many names a log line spells out before it summarizes the rest. A queue
+# holding hundreds of entries would otherwise write all of them into a single
+# unreadable line.
+LOG_NAME_LIMIT = 5
+
+
+def describe_names(names):
+    """Quote the first few names and summarize the remainder as a count."""
+    names = list(names)
+    shown = ["'%s'" % name for name in names[:LOG_NAME_LIMIT]]
+    if len(names) > LOG_NAME_LIMIT:
+        shown.append("and %d more" % (len(names) - LOG_NAME_LIMIT))
+    return ", ".join(shown)
 
 
 def sort_candidates(candidates, sort_keys):
@@ -605,7 +622,7 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
     ordered = sort_candidates(candidates, sort_keys)
     log_detail("Series by SortOrder (%s): %s."
                % (describe_sort_order(sort_keys),
-                  ", ".join("'%s'" % candidates[sid]["title"] for sid in ordered)))
+                  describe_names(candidates[sid]["title"] for sid in ordered)))
 
     # A series with 0 MB to fetch (everything paused) gains nothing from a
     # boost: it is neither the target nor almost finished, it is just idle.
@@ -637,20 +654,28 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
     if dropped:
         log_detail("MaxPrioritizedSeries=%d reached - %d almost finished series not boosted: %s."
                    % (max_prioritized, len(dropped),
-                      ", ".join("'%s'" % candidates[sid]["title"] for sid in dropped)))
+                      describe_names(candidates[sid]["title"] for sid in dropped)))
 
     # Flatten the boosted series into the individual queue entries, target
     # first. MaxPrioritizedSeries counts series, so a single series with a whole
     # season queued could still put the boost on the entire queue - this is the
-    # cap on the downloads themselves. Within a series the queue order wins,
-    # which is the order NZBGet would have fetched them in anyway.
-    boosted = [(sid, group) for sid in prioritized for group in candidates[sid]["groups"]]
+    # cap on the downloads themselves.
+    #
+    # Within a series the lowest NZBID wins, i.e. whatever was queued first.
+    # The order listgroups happens to return is not stable between runs, so
+    # taking the first N of it moved the boost to a completely different set of
+    # downloads on every queue event - none of them ever stayed on top long
+    # enough to finish. NZBIDs never change, so the same downloads keep the
+    # boost until they leave the queue.
+    boosted = [(sid, group)
+               for sid in prioritized
+               for group in sorted(candidates[sid]["groups"], key=lambda g: g[0])]
     if max_downloads > 0 and len(boosted) > max_downloads:
         skipped = boosted[max_downloads:]
         boosted = boosted[:max_downloads]
         log_detail("MaxPrioritizedDownloads=%d reached - %d download(s) not boosted: %s."
                    % (max_downloads, len(skipped),
-                      ", ".join("'%s'" % name for _, (_, name, _) in skipped)))
+                      describe_names(name for _, (_, name, _) in skipped)))
     boosted_ids = {nzbid for _, (nzbid, _, _) in boosted}
 
     if winner_id is not None:
