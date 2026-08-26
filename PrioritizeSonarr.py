@@ -18,6 +18,9 @@
 # Queue entries are mapped to Sonarr series via Sonarr's own download queue
 # (matching NZBGet's NZBID against Sonarr's downloadId, with a name-based
 # fallback), so no guessing from the release name is required.
+#
+# Events arriving less than MinInterval seconds after the last run are ignored,
+# so a burst of queue events does not turn into a burst of Sonarr requests.
 
 ##############################################################################
 ### OPTIONS                                                                ###
@@ -112,6 +115,22 @@
 # Downloads beyond the cap are reset to normal priority. Set to 0 for no limit.
 #MaxPrioritizedDownloads=0
 
+# Seconds that must have passed since the last run (0 = every event).
+#
+# Queue events can arrive in bursts (adding a whole season fires one NZB_ADDED
+# per nzb), and every run re-reads Sonarr and rewrites priorities. With an
+# interval set, events arriving during the cooldown are ignored and the queue is
+# left as it is until the next event after the interval has passed - so a fresh
+# download may have to wait that long before it is considered.
+#MinInterval=0
+
+# File the time of the last run is stored in.
+#
+# Only used when MinInterval is set. Supports NZBGet directory tokens
+# (${QueueDir}, ${TempDir}, ${ConfigDir}, ${MainDir}, ${ScriptDir}, ...);
+# a relative path is taken relative to MainDir.
+#StateFile=${QueueDir}/PrioritizeSonarr.state
+
 # Queue events to react to (comma separated).
 #
 # Possible events:
@@ -162,6 +181,13 @@ ACTIVE_STATUSES = ("QUEUED", "PAUSED", "DOWNLOADING", "FETCHING")
 # and #TotalTimeout defaults documented in the OPTIONS section above).
 DEFAULT_REQUEST_TIMEOUT = "10"
 DEFAULT_TOTAL_TIMEOUT = "30"
+
+# Default minimum distance between two runs and the file the time of the last
+# run is remembered in, 0 = react to every event (keep in sync with the
+# #MinInterval and #StateFile defaults documented in the OPTIONS section above).
+DEFAULT_MIN_INTERVAL = "0"
+STATE_FILE_NAME = "PrioritizeSonarr.state"
+DEFAULT_STATE_FILE = "${QueueDir}/" + STATE_FILE_NAME
 
 
 def log_info(message):
@@ -346,6 +372,128 @@ def is_unreachable(exc):
     if isinstance(exc, urllib.error.HTTPError):
         return False
     return isinstance(exc, (OSError, TimeBudgetExceeded))
+
+
+# --------------------------------------------------------------------------
+# Minimum interval between two runs
+# --------------------------------------------------------------------------
+#
+# Queue events arrive in bursts - adding a season fires one NZB_ADDED per nzb,
+# and each of them used to re-read Sonarr and rewrite the priorities, which
+# changes nothing the previous run had not already done. The time of the last
+# run is remembered in a small file so runs closer together than MinInterval can
+# be skipped. NZBGet starts a fresh process per event, so an in-memory timestamp
+# would be forgotten immediately.
+
+def resolve_path(path):
+    """Resolve a path option.
+
+    Supports NZBGet directory tokens (${QueueDir}, ${TempDir}, ${ConfigDir},
+    ${MainDir}, ${ScriptDir}, ...) and normal environment variables. A relative
+    path is resolved against MainDir.
+    """
+    if not path:
+        return path
+
+    tokens = {
+        "MainDir": os.environ.get("NZBOP_MAINDIR", ""),
+        "DestDir": os.environ.get("NZBOP_DESTDIR", ""),
+        "InterDir": os.environ.get("NZBOP_INTERDIR", ""),
+        "NzbDir": os.environ.get("NZBOP_NZBDIR", ""),
+        "QueueDir": os.environ.get("NZBOP_QUEUEDIR", ""),
+        "TempDir": os.environ.get("NZBOP_TEMPDIR", ""),
+        "ScriptDir": os.environ.get("NZBOP_SCRIPTDIR", ""),
+        # NZBGet exposes the config file, not its directory.
+        "ConfigDir": os.path.dirname(os.environ.get("NZBOP_CONFIGFILE", "")),
+    }
+    for name, value in tokens.items():
+        if value:
+            path = path.replace("${%s}" % name, value)
+
+    path = os.path.expanduser(os.path.expandvars(path))
+
+    # Relative paths are taken relative to MainDir (fall back to CWD).
+    if not os.path.isabs(path) and tokens["MainDir"]:
+        path = os.path.join(tokens["MainDir"], path)
+
+    return os.path.normpath(path)
+
+
+def default_state_file():
+    """Fall back to the first directory NZBGet tells us about.
+
+    Used when StateFile is empty or its directory token is not set (QueueDir is
+    missing when the script is run outside a normal NZBGet installation).
+    """
+    for name in ("NZBOP_QUEUEDIR", "NZBOP_TEMPDIR", "NZBOP_MAINDIR", "NZBOP_SCRIPTDIR"):
+        directory = os.environ.get(name, "").strip()
+        if directory:
+            return os.path.join(directory, STATE_FILE_NAME)
+    return STATE_FILE_NAME
+
+
+def read_last_run(path):
+    """Return the time of the last run as a unix timestamp, or None.
+
+    A missing or unreadable state file simply means "no idea when we last ran",
+    which lets this run go ahead - the cooldown must never be able to disable
+    the script permanently.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        log_detail("Could not read the last run time from '%s': %s" % (path, exc))
+        return None
+
+    value = data.get("last_run") if isinstance(data, dict) else data
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        log_detail("State file '%s' does not hold a usable timestamp." % path)
+        return None
+
+
+def write_last_run(path, when):
+    """Remember the time of this run, keeping the state file readable.
+
+    Written to a temporary file and renamed, so a run interrupted mid-write
+    cannot leave a truncated timestamp behind.
+    """
+    payload = {
+        "last_run": when,
+        # Purely informational - a bare unix timestamp is unreadable when you
+        # look into the file to find out why the script keeps skipping.
+        "last_run_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(when)),
+    }
+    temp_path = path + ".tmp"
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(temp_path, path)
+    except OSError as exc:
+        # Not fatal: without the timestamp the next event just works again.
+        log_warning("Could not store the last run time in '%s': %s" % (path, exc))
+
+
+def cooldown_left(path, min_interval, now):
+    """Seconds left of the cooldown; 0 when this run may do its work."""
+    if min_interval <= 0:
+        return 0
+    last = read_last_run(path)
+    if last is None:
+        return 0
+    if last > now:
+        # System clock moved backwards (or the file was copied from elsewhere) -
+        # the stored time would otherwise block the script until it catches up.
+        log_detail("Last run is in the future - ignoring the stored time.")
+        return 0
+    return max(0, min_interval - (now - last))
 
 
 # --------------------------------------------------------------------------
@@ -721,13 +869,27 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
 # --------------------------------------------------------------------------
 
 def handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb, sort_articles,
-                 sort_keys, max_prioritized, max_downloads):
+                 sort_keys, max_prioritized, max_downloads, min_interval, state_file):
     """QUEUE context: react to a queue event."""
     event = os.environ.get("NZBNA_EVENT", "")
     wanted = [e.upper() for e in parse_list(get_option("QueueEvents", "NZB_ADDED, URL_COMPLETED"))]
     if event.upper() not in wanted:
         log_detail("Ignoring queue event '%s' (not in QueueEvents)." % event)
         return SUCCESS
+
+    # Checked after the event filter: an event we do not act on has not done any
+    # work and must not start a cooldown.
+    now = time.time()
+    left = cooldown_left(state_file, min_interval, now)
+    if left > 0:
+        log_detail("Last run less than MinInterval=%d second(s) ago - skipping event '%s' "
+                   "(%d second(s) left)." % (min_interval, event, int(left) + 1))
+        return SUCCESS
+    if min_interval > 0:
+        # Stamped before the work, not after: a run that fails or runs out of
+        # its time budget still counts, otherwise an unreachable Sonarr would be
+        # retried by every single event of a burst.
+        write_last_run(state_file, now)
 
     try:
         prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb,
@@ -786,9 +948,19 @@ def main():
 
     sort_keys = parse_sort_order(get_option("SortOrder", DEFAULT_SORT_ORDER))
 
+    min_interval = to_int(get_option("MinInterval", DEFAULT_MIN_INTERVAL).strip(),
+                          to_int(DEFAULT_MIN_INTERVAL))
+    if min_interval < 0:
+        min_interval = 0
+    state_file = resolve_path(get_option("StateFile", DEFAULT_STATE_FILE).strip())
+    # An unset directory token leaves its "${...}" in place - that is not a path.
+    if not state_file or "${" in state_file:
+        state_file = default_state_file()
+
     if "NZBNA_EVENT" in os.environ:
         return handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb,
-                            sort_articles, sort_keys, max_prioritized, max_downloads)
+                            sort_articles, sort_keys, max_prioritized, max_downloads,
+                            min_interval, state_file)
 
     log_error("Unknown context: queue variables (NZBNA_) not set. This is a QUEUE script.")
     return ERROR

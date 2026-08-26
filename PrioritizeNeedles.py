@@ -17,6 +17,9 @@
 #
 # Runs both as a SCAN script (on the nzb being added) and as a QUEUE script
 # (on queue events like NZB_ADDED / URL_COMPLETED, also covering url downloads).
+#
+# With ApplyToQueue enabled, MinInterval limits how often the whole queue is
+# re-checked, so a burst of queue events does not turn into a burst of scans.
 
 ##############################################################################
 ### OPTIONS                                                                ###
@@ -76,6 +79,24 @@
 # added. Uses the RPC connection settings NZBGet passes to the script.
 #ApplyToQueue=no
 
+# Seconds that must have passed since the last full queue scan (0 = always).
+#
+# Only used together with ApplyToQueue, and only for the scan over the whole
+# queue: queue events arrive in bursts (adding a season fires one NZB_ADDED per
+# nzb) and re-checking every queue entry per event changes nothing the previous
+# scan had not already done. During the cooldown the nzb that triggered the
+# event is still prioritized as usual - only the sweep over the rest of the
+# queue is skipped, so an entry that was queued before its needle existed may
+# have to wait that long.
+#MinInterval=0
+
+# File the time of the last full queue scan is stored in.
+#
+# Only used when MinInterval is set. Supports NZBGet directory tokens
+# (${QueueDir}, ${TempDir}, ${ConfigDir}, ${MainDir}, ${ScriptDir}, ...);
+# a relative path is taken relative to MainDir.
+#StateFile=${QueueDir}/PrioritizeNeedles.state
+
 # Queue events to react to (comma separated).
 #
 # Only used when the script runs as a QUEUE script. Possible events:
@@ -98,6 +119,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.request
 
 # NZBGet exit codes for scan scripts.
@@ -111,6 +133,13 @@ DEFAULT_PRIORITY = "100"
 # NZBGet's "force" priority - such downloads run even while the queue is
 # paused. Assigned to downloads below ForceBelowMB.
 FORCE_PRIORITY = "900"
+
+# Default minimum distance between two full queue scans and the file the time of
+# the last one is remembered in, 0 = scan on every event (keep in sync with the
+# #MinInterval and #StateFile defaults documented in the OPTIONS section above).
+DEFAULT_MIN_INTERVAL = "0"
+STATE_FILE_NAME = "PrioritizeNeedles.state"
+DEFAULT_STATE_FILE = "${QueueDir}/" + STATE_FILE_NAME
 
 
 def log_info(message):
@@ -145,7 +174,7 @@ def parse_needles(raw):
 
 
 def resolve_path(path):
-    """Resolve a NeedleFile path.
+    """Resolve a path option (NeedleFile, StateFile).
 
     Supports NZBGet directory tokens (${MainDir}, ${ScriptDir}, ${ConfigDir},
     ${DestDir}, ...) and normal environment variables. A relative path is
@@ -199,6 +228,114 @@ def read_needle_file(path):
     except OSError as exc:
         log_warning("Could not read NeedleFile '%s': %s" % (resolved, exc))
     return needles
+
+
+# --------------------------------------------------------------------------
+# Minimum interval between two full queue scans
+# --------------------------------------------------------------------------
+#
+# ApplyToQueue re-checks every queue entry, and queue events arrive in bursts -
+# adding a season fires one NZB_ADDED per nzb, each of them re-reading the whole
+# queue for nothing. The time of the last scan is remembered in a small file so
+# scans closer together than MinInterval can be skipped; NZBGet starts a fresh
+# process per event, so an in-memory timestamp would be forgotten immediately.
+# Scan and queue context share the file, which also collapses the scan and the
+# NZB_ADDED event of the same nzb into a single sweep.
+
+def default_state_file():
+    """Fall back to the first directory NZBGet tells us about.
+
+    Used when StateFile is empty or its directory token is not set (QueueDir is
+    missing when the script is run outside a normal NZBGet installation).
+    """
+    for name in ("NZBOP_QUEUEDIR", "NZBOP_TEMPDIR", "NZBOP_MAINDIR", "NZBOP_SCRIPTDIR"):
+        directory = os.environ.get(name, "").strip()
+        if directory:
+            return os.path.join(directory, STATE_FILE_NAME)
+    return STATE_FILE_NAME
+
+
+def read_last_run(path):
+    """Return the time of the last queue scan as a unix timestamp, or None.
+
+    A missing or unreadable state file simply means "no idea when we last
+    scanned", which lets this scan go ahead - the cooldown must never be able to
+    disable ApplyToQueue permanently.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        log_detail("Could not read the last scan time from '%s': %s" % (path, exc))
+        return None
+
+    value = data.get("last_run") if isinstance(data, dict) else data
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        log_detail("State file '%s' does not hold a usable timestamp." % path)
+        return None
+
+
+def write_last_run(path, when):
+    """Remember the time of this queue scan, keeping the state file readable.
+
+    Written to a temporary file and renamed, so a run interrupted mid-write
+    cannot leave a truncated timestamp behind.
+    """
+    payload = {
+        "last_run": when,
+        # Purely informational - a bare unix timestamp is unreadable when you
+        # look into the file to find out why the script keeps skipping.
+        "last_run_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(when)),
+    }
+    temp_path = path + ".tmp"
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(temp_path, path)
+    except OSError as exc:
+        # Not fatal: without the timestamp the next event just scans again.
+        log_warning("Could not store the last scan time in '%s': %s" % (path, exc))
+
+
+def cooldown_left(path, min_interval, now):
+    """Seconds left of the cooldown; 0 when the queue may be scanned now."""
+    if min_interval <= 0:
+        return 0
+    last = read_last_run(path)
+    if last is None:
+        return 0
+    if last > now:
+        # System clock moved backwards (or the file was copied from elsewhere) -
+        # the stored time would otherwise block the scan until it catches up.
+        log_detail("Last scan is in the future - ignoring the stored time.")
+        return 0
+    return max(0, min_interval - (now - last))
+
+
+def queue_sweep_allowed(min_interval, state_file):
+    """True if the whole queue may be re-checked now; stamps the scan.
+
+    Stamped before the scan, not after: a scan that fails half way through still
+    counts, otherwise an unreachable RPC would be retried by every single event
+    of a burst.
+    """
+    if min_interval <= 0:
+        return True
+    now = time.time()
+    left = cooldown_left(state_file, min_interval, now)
+    if left > 0:
+        log_detail("Last queue scan less than MinInterval=%d second(s) ago - not scanning the "
+                   "queue (%d second(s) left)." % (min_interval, int(left) + 1))
+        return False
+    write_last_run(state_file, now)
+    return True
 
 
 def normalize(text):
@@ -349,7 +486,7 @@ def apply_to_queue(needles, mode, priority, move_to_top, force_below_mb):
     log_detail("Queue scan finished - %d entr%s updated." % (count, "y" if count == 1 else "ies"))
 
 
-def handle_scan(needles, mode, priority, move_to_top, force_below_mb):
+def handle_scan(needles, mode, priority, move_to_top, force_below_mb, min_interval, state_file):
     """SCAN context: influence the nzb being added via stdout commands."""
     nzb_name = os.environ["NZBNP_NZBNAME"]
 
@@ -369,8 +506,10 @@ def handle_scan(needles, mode, priority, move_to_top, force_below_mb):
             log_detail("Moving '%s' to the top of the queue." % nzb_name)
             print("[NZB] TOP=1")
 
-    # 2. Optionally re-prioritize nzbs already in the queue (via RPC).
-    if get_bool_option("ApplyToQueue", False):
+    # 2. Optionally re-prioritize nzbs already in the queue (via RPC). The nzb
+    #    being added is handled above either way, so a cooldown here only delays
+    #    the entries that were already queued.
+    if get_bool_option("ApplyToQueue", False) and queue_sweep_allowed(min_interval, state_file):
         apply_to_queue(needles, mode, priority, move_to_top, force_below_mb)
 
     return SUCCESS
@@ -405,7 +544,7 @@ def prioritize_nzbid(name, nzbid, needle, priority, move_to_top, force_below_mb)
         editqueue("GroupMoveTop", 0, [nzbid])
 
 
-def handle_queue(needles, mode, priority, move_to_top, force_below_mb):
+def handle_queue(needles, mode, priority, move_to_top, force_below_mb, min_interval, state_file):
     """QUEUE context: react to a queue event."""
     event = os.environ.get("NZBNA_EVENT", "")
     wanted = [e.upper() for e in parse_needles(get_option("QueueEvents", "NZB_ADDED, URL_COMPLETED"))]
@@ -414,7 +553,10 @@ def handle_queue(needles, mode, priority, move_to_top, force_below_mb):
         return SUCCESS
 
     # ApplyToQueue re-checks the entire queue; otherwise only the event's nzb.
-    if get_bool_option("ApplyToQueue", False):
+    # The queue-wide scan is what MinInterval limits - while it is on cooldown we
+    # fall through to the event's own nzb, so a fresh download still gets its
+    # priority right away instead of losing it until the cooldown expires.
+    if get_bool_option("ApplyToQueue", False) and queue_sweep_allowed(min_interval, state_file):
         apply_to_queue(needles, mode, priority, move_to_top, force_below_mb)
         return SUCCESS
 
@@ -471,11 +613,23 @@ def main():
         priority = DEFAULT_PRIORITY
 
     move_to_top = get_bool_option("MoveToTop", False)
+
+    min_interval = to_int(get_option("MinInterval", DEFAULT_MIN_INTERVAL).strip(),
+                          to_int(DEFAULT_MIN_INTERVAL))
+    if min_interval < 0:
+        min_interval = 0
+    state_file = resolve_path(get_option("StateFile", DEFAULT_STATE_FILE).strip())
+    # An unset directory token leaves its "${...}" in place - that is not a path.
+    if not state_file or "${" in state_file:
+        state_file = default_state_file()
+
     # Dispatch by context: SCAN sets NZBNP_*, QUEUE sets NZBNA_*.
     if "NZBNP_NZBNAME" in os.environ:
-        return handle_scan(needles, mode, priority, move_to_top, force_below_mb)
+        return handle_scan(needles, mode, priority, move_to_top, force_below_mb,
+                           min_interval, state_file)
     if "NZBNA_EVENT" in os.environ:
-        return handle_queue(needles, mode, priority, move_to_top, force_below_mb)
+        return handle_queue(needles, mode, priority, move_to_top, force_below_mb,
+                            min_interval, state_file)
 
     log_error("Unknown context: neither scan (NZBNP_) nor queue (NZBNA_) variables set.")
     return ERROR

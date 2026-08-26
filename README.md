@@ -48,6 +48,8 @@ Requirements: NZBGet 13.0 or later and Python 3.
 | `MatchMode`     | `substring` (plain text) or `regex` (Python regular expr.)   | `substring` |
 | `MoveToTop`     | Move matched downloads to the top of the queue (`yes` / `no`)| `no`        |
 | `ApplyToQueue`  | Also re-prioritize nzbs already in the queue (`yes` / `no`)   | `no`        |
+| `MinInterval`   | Seconds between two full queue scans (`0` = every event)      | `0`         |
+| `StateFile`     | Where the time of the last full queue scan is stored         | `${QueueDir}/PrioritizeNeedles.state` |
 | `QueueEvents`   | Queue events to react to (comma-separated)                   | `NZB_ADDED, URL_COMPLETED` |
 
 Matching **ignores case, spaces and dots** on both sides, so the needle
@@ -112,6 +114,25 @@ It uses the RPC connection settings NZBGet passes to the script
 (`ControlIP`/`ControlPort`/`ControlUsername`/`ControlPassword`), so no extra
 configuration is needed. If the queue can't be reached, a warning is logged and
 the newly added nzb is still handled normally.
+
+#### Limiting how often the queue is scanned
+
+Queue events arrive in bursts — adding a whole season fires one `NZB_ADDED` per
+nzb, and each of them re-reads the entire queue and rewrites priorities the
+previous scan had already set. Set `MinInterval` to a number of seconds and a
+scan closer than that to the last one is skipped.
+
+Only the scan over the whole queue is affected: the nzb that triggered the event
+(or is being scanned) is still prioritized immediately, so nothing loses its
+priority — an entry that was *already* queued before its needle existed just has
+to wait for the next event after the interval.
+
+The time of the last scan has to survive between runs (NZBGet starts a fresh
+process per event), so it is kept in `StateFile` — a small JSON file, by default
+`${QueueDir}/PrioritizeNeedles.state`, supporting the same directory tokens as
+`NeedleFile`. It is only written when `MinInterval` is set. If it is missing or
+unreadable the scan simply runs, so a broken state file can never disable
+`ApplyToQueue` for good.
 
 ### Queue events
 
