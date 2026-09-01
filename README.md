@@ -45,6 +45,7 @@ Requirements: NZBGet 13.0 or later and Python 3.
 | `NeedleFile`    | Path to a file with one needle per line (for longer lists)   | *(empty)*   |
 | `MatchPriority` | Priority to assign on a match                                | `100`       |
 | `ForceBelowMB`  | Force downloads smaller than this many MB (`0` disables)     | `0`         |
+| `ForcePriority` | Priority for downloads below `ForceBelowMB`                  | `900`       |
 | `MatchMode`     | `substring` (plain text) or `regex` (Python regular expr.)   | `substring` |
 | `MoveToTop`     | Move matched downloads to the top of the queue (`yes` / `no`)| `no`        |
 | `ApplyToQueue`  | Also re-prioritize nzbs already in the queue (`yes` / `no`)   | `no`        |
@@ -80,13 +81,17 @@ S\d+E\d+
 ### Forcing small downloads
 
 Set `ForceBelowMB` to a size in MB and every download **below** that size gets
-NZBGet's `900` (*force*) priority, so it runs even while the queue is paused —
-a 20 MB subtitle pack no longer waits behind a 50 GB release. No needle has to
-match: this applies to every download the script looks at, and `NeedleList` /
-`NeedleFile` may stay empty. If a download is both small **and** matches a
-needle, force wins, being the higher of the two priorities.
+`ForcePriority` — by default NZBGet's `900` (*force*), so it runs even while the
+queue is paused and a 20 MB subtitle pack no longer waits behind a 50 GB
+release. No needle has to match: this applies to every download the script looks
+at, and `NeedleList` / `NeedleFile` may stay empty. If a download is both small
+**and** matches a needle, `ForcePriority` takes precedence.
 
 `0` (the default) disables the rule and keeps the script needle-only.
+
+`ForcePriority` accepts any integer (see [Priority values](#priority-values)),
+so the rule can also be used to merely nudge small downloads up (e.g. `100`)
+instead of forcing them past a paused queue.
 
 Two limitations worth knowing:
 
@@ -170,7 +175,8 @@ With `NeedleList = 1080p, ubuntu` and `MatchPriority = 900`:
 - `Random.720p.nzb`      → no match → left unchanged
 
 With `ForceBelowMB = 100` on top of that, a queued `Random.720p` of 40 MB is
-forced to `900` despite matching no needle, while a 4 GB one stays untouched.
+set to `ForcePriority` (`900` by default) despite matching no needle, while a
+4 GB one stays untouched.
 
 ## Testing without NZBGet
 
