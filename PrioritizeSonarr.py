@@ -44,7 +44,10 @@
 # Seconds this script may spend in total before it gives up (0 = no limit).
 #
 # Upper bound for how long NZBGet can be blocked by this script, across all
-# requests. When the budget runs out the queue is left as it is.
+# requests. When the budget runs out the queue is left as it is. Keep it well
+# above RequestTimeout: a request is only started while at least a second of
+# the budget is left, so that what remains of it cannot turn into a timeout
+# that looks like Sonarr's fault.
 #TotalTimeout=30
 
 # Ignore series carrying this Sonarr tag (leave empty to disable).
@@ -351,15 +354,44 @@ def start_time_budget(request_timeout, total_timeout):
     _deadline = time.monotonic() + _total_timeout if _total_timeout > 0 else None
 
 
+# A request needs at least this much of the budget left to stand a chance.
+# Below that the shrinking slice would only buy a "timed out" that blames the
+# other side for our own exhausted budget, so TotalTimeout should always be set
+# comfortably above RequestTimeout.
+MIN_REQUEST_SLICE = 1.0
+
+
 def next_timeout():
     """Timeout for the next request, capped by what is left of the budget."""
     if _deadline is None:
         return _request_timeout
     left = _deadline - time.monotonic()
-    if left <= 0:
+    if left < MIN_REQUEST_SLICE:
         raise TimeBudgetExceeded(
             "TotalTimeout of %d second(s) is used up" % _total_timeout)
     return min(_request_timeout, left)
+
+
+def fetch_json(request, what):
+    """Run an HTTP request inside the time budget and decode its JSON answer.
+
+    ``what`` names the endpoint, so a failure says which one stalled instead of
+    leaving several calls sharing one anonymous "timed out". A timeout that only
+    happened because the budget had cut the request short is reported as the
+    budget running out rather than as the other side being slow.
+    """
+    timeout = next_timeout()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError:
+        raise  # an answer, just not the one we wanted - never a budget problem
+    except OSError as exc:
+        if _deadline is not None and time.monotonic() >= _deadline:
+            raise TimeBudgetExceeded(
+                "TotalTimeout of %d second(s) is used up waiting for %s"
+                % (_total_timeout, what)) from exc
+        raise
 
 
 def is_unreachable(exc):
@@ -519,8 +551,7 @@ def rpc_call(method, params):
         token = base64.b64encode(("%s:%s" % (username, password)).encode("utf-8")).decode("ascii")
         request.add_header("Authorization", "Basic " + token)
 
-    with urllib.request.urlopen(request, timeout=next_timeout()) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    payload = fetch_json(request, "NZBGet's RPC method '%s'" % method)
     if payload.get("error"):
         raise RuntimeError(payload["error"])
     return payload.get("result")
@@ -582,8 +613,7 @@ def sonarr_request(base_url, api_key, path):
     request = urllib.request.Request(url)
     request.add_header("X-Api-Key", api_key)
     request.add_header("Accept", "application/json")
-    with urllib.request.urlopen(request, timeout=next_timeout()) as response:
-        return json.loads(response.read().decode("utf-8"))
+    return fetch_json(request, "Sonarr's %s" % path)
 
 
 # Paging for Sonarr's queue endpoint. Big NZBGet queues can hold more entries
@@ -661,35 +691,68 @@ def map_group_to_series_id(group, queue_records):
 # Prioritizing
 # --------------------------------------------------------------------------
 
-def set_priority(name, nzbid, current_priority, priority, move_to_top):
-    """Apply the target priority to a single queued nzb via RPC."""
-    if current_priority == to_int(priority):
-        log_detail("'%s' already has priority %s - leaving it untouched." % (name, priority))
-        return
+# editqueue takes a list of ids, so one priority costs one RPC round-trip no
+# matter how many downloads it is written to. Doing it per download instead
+# turned a long queue into hundreds of sequential requests - and NZBGet waits
+# for this script while they run, which is exactly what TotalTimeout is there
+# to bound.
+
+def apply_edit(command, param, entries, description):
+    """Run one editqueue command over a whole batch of queue entries.
+
+    Returns True when the batch was written. An unreachable NZBGet aborts the
+    run instead of being retried: the next batch would only block NZBGet for
+    another RequestTimeout, and none of them can succeed while the RPC-API is
+    not answering.
+    """
+    if not entries:
+        return False
     try:
-        editqueue("GroupSetPriority", priority, [nzbid])
-        if move_to_top:
-            editqueue("GroupMoveTop", 0, [nzbid])
+        editqueue(command, param, [nzbid for nzbid, _ in entries])
     except TimeBudgetExceeded:
         raise  # out of time - stop instead of blocking NZBGet any longer
     except Exception as exc:  # noqa: BLE001
-        log_warning("Could not update queue entry '%s': %s" % (name, exc))
-        return
-    log_info("'%s' priority set to %s." % (name, priority))
+        if is_unreachable(exc):
+            raise
+        log_warning("Could not %s for %d download(s) (%s): %s"
+                    % (description, len(entries),
+                       describe_names(name for _, name in entries), exc))
+        return False
+    return True
+
+
+def set_priorities(entries, priority):
+    """Write one priority to every entry of a batch."""
+    if apply_edit("GroupSetPriority", priority, entries, "set priority %s" % priority):
+        log_info("Priority %s set on %d download(s): %s."
+                 % (priority, len(entries), describe_names(name for _, name in entries)))
+
+
+def move_top(entries):
+    """Move a batch of queue entries to the top of the queue."""
+    if apply_edit("GroupMoveTop", 0, entries, "move to the top of the queue"):
+        log_detail("Moved %d download(s) to the top of the queue: %s."
+                   % (len(entries), describe_names(name for _, name in entries)))
 
 
 def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_top, min_remaining_mb,
                              sort_articles, sort_keys, max_prioritized, max_downloads):
     """Prioritize the downloads of the first queued Sonarr series in sort order."""
+    # Which of the three calls stalled matters: /series grows with the library
+    # and /queue is paged over the whole NZBGet queue, so they fail for very
+    # different reasons.
+    endpoint = "/series"
     try:
-        series_list = sonarr_request(base_url, api_key, "/series")
-        tags = sonarr_request(base_url, api_key, "/tag")
+        series_list = sonarr_request(base_url, api_key, endpoint)
+        endpoint = "/tag"
+        tags = sonarr_request(base_url, api_key, endpoint)
+        endpoint = "/queue"
         queue_records = sonarr_queue_records(base_url, api_key)
     except TimeBudgetExceeded:
         raise
     except Exception as exc:  # noqa: BLE001
-        log_warning("Could not query Sonarr at %s: %s - leaving the queue as it is."
-                    % (base_url.rstrip("/"), exc))
+        log_warning("Could not query Sonarr at %s (%s): %s - leaving the queue as it is."
+                    % (base_url.rstrip("/"), endpoint, exc))
         return
 
     exclude_tag_id = tag_id_for_label(tags, exclude_tag) if exclude_tag else None
@@ -832,15 +895,30 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
                  % (winner["title"], winner["total"], winner["remaining"],
                     sum(1 for sid, _ in boosted if sid == winner_id), len(winner["groups"])))
 
+    # Collect what has to be written before writing anything, so the whole run
+    # comes down to two editqueue calls (plus one for MoveToTop) instead of one
+    # per download.
+    #
     # The target's downloads may be moved to the top; the almost finished
-    # series keep their place in the queue and only get the priority.
+    # series keep their place in the queue and only get the priority. An entry
+    # that already carries the boost is left alone entirely - re-moving it to
+    # the top on every queue event would only shuffle the queue.
+    boost = to_int(priority)
+    normal = to_int(NORMAL_PRIORITY)
+    to_boost = []
+    to_top = []
     logged = set()
     for series_id, (nzbid, name, current_priority) in boosted:
         if series_id != winner_id and series_id not in logged:
             logged.add(series_id)
             log_detail("Keeping almost finished '%s' (%d MB left) prioritized."
                        % (candidates[series_id]["title"], candidates[series_id]["remaining"]))
-        set_priority(name, nzbid, current_priority, priority, move_to_top and series_id == winner_id)
+        if current_priority == boost:
+            log_detail("'%s' already has priority %s - leaving it untouched." % (name, priority))
+            continue
+        to_boost.append((nzbid, name))
+        if move_to_top and series_id == winner_id:
+            to_top.append((nzbid, name))
 
     if not boosted:
         log_detail("No eligible download to prioritize.")
@@ -851,17 +929,22 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
     # exactly missed leftovers from an earlier MatchPriority and groups
     # reporting a different value. Priorities above the boost (e.g. a manually
     # forced 900) and deliberately lowered ones are left alone.
-    boost = to_int(priority)
-    normal = to_int(NORMAL_PRIORITY)
+    to_reset = []
     for entry in candidates.values():
         for nzbid, name, current_priority in entry["groups"]:
             if nzbid in boosted_ids:
                 continue
             if normal < current_priority <= boost:
-                set_priority(name, nzbid, current_priority, NORMAL_PRIORITY, False)
+                to_reset.append((nzbid, name))
             elif current_priority > boost:
                 log_detail("'%s' has priority %d above MatchPriority %d - leaving it untouched."
                            % (name, current_priority, boost))
+
+    # Written last: if the budget runs out here, the boost is already in place
+    # and only the reset is missing, which the next event catches up on.
+    set_priorities(to_boost, priority)
+    move_top(to_top)
+    set_priorities(to_reset, NORMAL_PRIORITY)
 
 
 # --------------------------------------------------------------------------
@@ -898,6 +981,12 @@ def handle_queue(base_url, api_key, exclude_tag, priority, move_to_top, min_rema
         # Not an error: nothing is broken, we just refuse to keep NZBGet
         # waiting. The next queue event tries again.
         log_warning("%s - giving up to keep the queue moving." % exc)
+    except OSError as exc:
+        # NZBGet's own RPC-API stopped answering while we were writing
+        # priorities. Every further call would block for another
+        # RequestTimeout, so the rest of the queue is left as it is.
+        log_warning("NZBGet's RPC-API did not answer (%s) - leaving the rest of the queue as it is."
+                    % exc)
     return SUCCESS
 
 

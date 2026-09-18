@@ -166,6 +166,62 @@ NZBGet's predefined priorities: `-100` (very low), `-50` (low), `0` (normal),
 `50` (high), `100` (very high), `900` (force — downloads even while NZBGet is
 paused). Any integer is accepted.
 
+## Running alongside PrioritizeSonarr
+
+`PrioritizeSonarr.py` (same repository) is also a queue script and also writes
+priorities, so the two have to be told apart — otherwise they overwrite each
+other on every queue event.
+
+The two behave differently: this script only ever **raises** a priority and
+leaves everything else alone. PrioritizeSonarr also **lowers** — after boosting
+its target series it resets every queue entry it could map to a Sonarr series
+back to `0`, as long as that entry's priority is above normal and **at most**
+its own `MatchPriority`. Anything **above** that value it deliberately leaves
+untouched.
+
+With overlapping values (both at the default `100`) that means a needle match
+on a Sonarr download is reset to `0` by the next PrioritizeSonarr run, and
+raised again by the next PrioritizeNeedles run. Which one you see depends on the
+order of the extensions and on the two `MinInterval` cooldowns, which run
+independently because each script keeps its own state file.
+
+### Priority bands
+
+Give each script its own range and keep every priority this script assigns
+**strictly above** PrioritizeSonarr's `MatchPriority`:
+
+| Option                          | Suggested value | Why                                      |
+|---------------------------------|-----------------|------------------------------------------|
+| `PrioritizeSonarr.MatchPriority`| `100`           | Sonarr's band is everything up to `100`  |
+| `MatchPriority` (this script)   | `200`           | above the band → never reset by Sonarr   |
+| `ForcePriority` (this script)   | `900`           | force, stays on top of both              |
+
+Some downloads are outside the conflict entirely, no matter how the bands are
+set:
+
+- **Not a Sonarr download.** PrioritizeSonarr only touches queue entries it
+  could map to a Sonarr series, so movies and everything unknown to Sonarr are
+  left to this script.
+- **Excluded series.** Series carrying PrioritizeSonarr's `ExcludeTag`
+  (default `nop`) never enter its candidate list and are never reset. Tagging
+  the series a needle targets is the alternative to the bands above.
+- **Lowered priorities.** PrioritizeSonarr only resets priorities *above*
+  normal, so anything at or below `0` is safe.
+
+Two things to watch out for:
+
+- The default `ForcePriority` of `900` is above Sonarr's default band and
+  therefore already safe. Raising PrioritizeSonarr's `MatchPriority` to `900`
+  as well brings it back into the band (the check is `<=`), and a forced small
+  download of a Sonarr series gets reset to `0`.
+- `ApplyToQueue` widens the overlap from the nzb that triggered the event to
+  the whole queue on every event. With PrioritizeSonarr running too, leave it
+  off unless the bands are set.
+
+`MoveToTop` in both scripts is not banded — the queue *position* is whatever the
+script that ran last made it. That is mostly cosmetic, since NZBGet picks
+downloads by priority first and position only decides between equal priorities.
+
 ## Example
 
 With `NeedleList = 1080p, ubuntu` and `MatchPriority = 900`:
