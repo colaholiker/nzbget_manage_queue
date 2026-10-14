@@ -75,7 +75,10 @@
 #                      (a season pack counts all its episodes);
 #   remainingPercent - share of the series' episodes still in the download
 #                      queue (remainingCount / episodes);
-#   size             - total MB of the series' queued downloads;
+#   downloaded       - episodes of the series Sonarr already has a file for;
+#   downloadedPercent - share of the series' episodes already downloaded
+#                      (downloaded / episodes);
+#   size           - total MB of the series' queued downloads;
 #   downloads        - number of queued downloads of the series;
 #   year             - year the series started;
 #   title            - series title (see IgnoreLeadingArticles).
@@ -84,6 +87,8 @@
 #           remaining, title         - fewest MB left first;
 #           remainingCount, title    - fewest episodes left first;
 #           remainingPercent, title  - series closest to being complete first;
+#           -downloaded, title       - most episodes already downloaded first;
+#           -downloadedPercent, title - most complete series first;
 #           -year, episodes          - newest series first;
 #           -size, title             - biggest download first.
 #SortOrder=episodes, title
@@ -269,6 +274,8 @@ SORT_KEYS = {
     "remaining": "remaining",
     "remainingcount": "remaining_count",
     "remainingpercent": "remaining_percent",
+    "downloaded": "downloaded",
+    "downloadedpercent": "downloaded_percent",
     "size": "size",
     "downloads": "downloads",
     "year": "year",
@@ -676,6 +683,12 @@ def series_total_episodes(series):
     return to_int(total, 0)
 
 
+def series_downloaded_episodes(series):
+    """Number of episodes of a series Sonarr already has a file for."""
+    stats = series.get("statistics") or {}
+    return to_int(stats.get("episodeFileCount"), 0)
+
+
 def match_queue_records(group, queue_records):
     """Return Sonarr's queue records belonging to an NZBGet queue group.
 
@@ -830,6 +843,8 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
             "title": title,
             "sortname": sort_title(title, sort_articles),
             "total": series_total_episodes(series),
+            "downloaded": series_downloaded_episodes(series),
+            "downloaded_percent": 0.0,
             "year": to_int(series.get("year"), 0),
             "remaining": 0,
             "remaining_count": 0,
@@ -856,13 +871,16 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
         log_detail("No queued download could be matched to an eligible Sonarr series.")
         return
 
-    # Share of each series' episodes still queued. Without a known total the
-    # series can't be judged and is treated as completely missing (100 %).
+    # Share of each series' episodes still queued and already downloaded.
+    # Without a known total the series can't be judged and is treated as
+    # completely missing (100 % queued, 0 % downloaded).
     for entry in candidates.values():
         if entry["total"] > 0:
             entry["remaining_percent"] = min(100.0, 100.0 * entry["remaining_count"] / entry["total"])
+            entry["downloaded_percent"] = min(100.0, 100.0 * entry["downloaded"] / entry["total"])
         else:
             entry["remaining_percent"] = 100.0
+            entry["downloaded_percent"] = 0.0
 
     # Order the eligible series by the configured SortOrder.
     ordered = sort_candidates(candidates, sort_keys)
@@ -926,10 +944,10 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
 
     if winner_id is not None:
         winner = candidates[winner_id]
-        log_info("Target series: '%s' (%d episode(s) total, %d MB / %d episode(s) / %.1f%% left)"
-                 " - prioritizing %d of %d download(s)."
-                 % (winner["title"], winner["total"], winner["remaining"],
-                    winner["remaining_count"], winner["remaining_percent"],
+        log_info("Target series: '%s' (%d episode(s) total, %d / %.1f%% downloaded,"
+                 " %d MB / %d episode(s) / %.1f%% left) - prioritizing %d of %d download(s)."
+                 % (winner["title"], winner["total"], winner["downloaded"], winner["downloaded_percent"],
+                    winner["remaining"], winner["remaining_count"], winner["remaining_percent"],
                     sum(1 for sid, _ in boosted if sid == winner_id), len(winner["groups"])))
 
     # Collect what has to be written before writing anything, so the whole run
