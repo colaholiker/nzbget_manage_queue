@@ -69,17 +69,23 @@
 #
 # The first key decides, the following ones break ties. Prefix a key with "-"
 # to reverse it (biggest/last first). Known keys:
-#   episodes  - number of episodes the series has in total;
-#   remaining - MB the series still has to download;
-#   size      - total MB of the series' queued downloads;
-#   downloads - number of queued downloads of the series;
-#   year      - year the series started;
-#   title     - series title (see IgnoreLeadingArticles).
+#   episodes         - number of episodes the series has in total;
+#   remaining        - MB the series still has to download;
+#   remainingCount   - episodes of the series still in the download queue
+#                      (a season pack counts all its episodes);
+#   remainingPercent - share of the series' episodes still in the download
+#                      queue (remainingCount / episodes);
+#   size             - total MB of the series' queued downloads;
+#   downloads        - number of queued downloads of the series;
+#   year             - year the series started;
+#   title            - series title (see IgnoreLeadingArticles).
 #
-# Examples: episodes, title       - shortest series first (default);
-#           remaining, title      - series closest to being finished first;
-#           -year, episodes       - newest series first;
-#           -size, title          - biggest download first.
+# Examples: episodes, title          - shortest series first (default);
+#           remaining, title         - fewest MB left first;
+#           remainingCount, title    - fewest episodes left first;
+#           remainingPercent, title  - series closest to being complete first;
+#           -year, episodes          - newest series first;
+#           -size, title             - biggest download first.
 #SortOrder=episodes, title
 
 # Ignore leading articles when sorting series alphabetically (yes, no).
@@ -256,10 +262,13 @@ def sort_title(text, articles):
 
 
 # Sort keys usable in the SortOrder option, mapped to the candidate field they
-# read (keep in sync with the #SortOrder documentation above).
+# read (keep in sync with the #SortOrder documentation above). Keys are
+# matched lower-cased, so "remainingCount" in the option finds "remainingcount".
 SORT_KEYS = {
     "episodes": "total",
     "remaining": "remaining",
+    "remainingcount": "remaining_count",
+    "remainingpercent": "remaining_percent",
     "size": "size",
     "downloads": "downloads",
     "year": "year",
@@ -667,24 +676,37 @@ def series_total_episodes(series):
     return to_int(total, 0)
 
 
-def map_group_to_series_id(group, queue_records):
-    """Find the Sonarr seriesId for an NZBGet queue group, or None.
+def match_queue_records(group, queue_records):
+    """Return Sonarr's queue records belonging to an NZBGet queue group.
 
     Primary match: NZBGet NZBID == Sonarr downloadId. Fallback: the normalized
-    release name equals Sonarr's queue title.
+    release name equals Sonarr's queue title. Sonarr keeps one record per
+    episode, so a season pack yields several records.
     """
     nzbid = str(to_int(group.get("NZBID"), -1))
-    for rec in queue_records:
-        download_id = str(rec.get("downloadId") or "").strip()
-        if download_id and download_id == nzbid:
-            return to_int(rec.get("seriesId"), -1)
+    matches = [rec for rec in queue_records
+               if str(rec.get("downloadId") or "").strip() == nzbid]
+    if matches:
+        return matches
 
     name = normalize(group.get("NZBName") or group.get("NZBNicename") or "")
     if name:
-        for rec in queue_records:
-            if normalize(rec.get("title") or "") == name:
-                return to_int(rec.get("seriesId"), -1)
-    return None
+        return [rec for rec in queue_records if normalize(rec.get("title") or "") == name]
+    return []
+
+
+def map_group_to_series_id(records):
+    """Return the Sonarr seriesId of a group's matched queue records, or None."""
+    if not records:
+        return None
+    return to_int(records[0].get("seriesId"), -1)
+
+
+def count_episodes(records):
+    """Number of distinct episodes in a group's queue records (at least 1)."""
+    episode_ids = {to_int(rec.get("episodeId"), -1) for rec in records}
+    episode_ids.discard(-1)
+    return max(1, len(episode_ids))
 
 
 # --------------------------------------------------------------------------
@@ -785,7 +807,8 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
                        % (name, group.get("Status") or "?"))
             continue
 
-        series_id = map_group_to_series_id(group, queue_records)
+        records = match_queue_records(group, queue_records)
+        series_id = map_group_to_series_id(records)
         if series_id is None or series_id < 0:
             log_detail("Queue entry '%s' is not linked to a Sonarr series - skipping." % name)
             continue
@@ -809,6 +832,8 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
             "total": series_total_episodes(series),
             "year": to_int(series.get("year"), 0),
             "remaining": 0,
+            "remaining_count": 0,
+            "remaining_percent": 0.0,
             "size": 0,
             "downloads": 0,
             "groups": [],
@@ -818,16 +843,26 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
         remaining_mb = to_int(group.get("RemainingSizeMB"), 0)
         paused_mb = to_int(group.get("PausedSizeMB"), 0)
         active_mb = max(0, remaining_mb - paused_mb)
+        episodes = count_episodes(records)
         entry["remaining"] += active_mb
+        entry["remaining_count"] += episodes
         entry["size"] += to_int(group.get("FileSizeMB"), 0)
         entry["downloads"] += 1
         entry["groups"].append((to_int(nzbid, -1), name, get_group_priority(group)))
-        log_detail("'%s' -> series '%s': %d MB to download (%d MB total, %d MB paused)."
-                   % (name, entry["title"], active_mb, remaining_mb, paused_mb))
+        log_detail("'%s' -> series '%s': %d MB to download (%d MB total, %d MB paused), %d episode(s)."
+                   % (name, entry["title"], active_mb, remaining_mb, paused_mb, episodes))
 
     if not candidates:
         log_detail("No queued download could be matched to an eligible Sonarr series.")
         return
+
+    # Share of each series' episodes still queued. Without a known total the
+    # series can't be judged and is treated as completely missing (100 %).
+    for entry in candidates.values():
+        if entry["total"] > 0:
+            entry["remaining_percent"] = min(100.0, 100.0 * entry["remaining_count"] / entry["total"])
+        else:
+            entry["remaining_percent"] = 100.0
 
     # Order the eligible series by the configured SortOrder.
     ordered = sort_candidates(candidates, sort_keys)
@@ -891,8 +926,10 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
 
     if winner_id is not None:
         winner = candidates[winner_id]
-        log_info("Target series: '%s' (%d episode(s) total, %d MB left) - prioritizing %d of %d download(s)."
+        log_info("Target series: '%s' (%d episode(s) total, %d MB / %d episode(s) / %.1f%% left)"
+                 " - prioritizing %d of %d download(s)."
                  % (winner["title"], winner["total"], winner["remaining"],
+                    winner["remaining_count"], winner["remaining_percent"],
                     sum(1 for sid, _ in boosted if sid == winner_id), len(winner["groups"])))
 
     # Collect what has to be written before writing anything, so the whole run
