@@ -106,6 +106,21 @@
 # a relative path is taken relative to MainDir.
 #StateFile=${QueueDir}/PrioritizeNeedles.state
 
+# Seconds to wait for a single NZBGet RPC request (minimum 1).
+#
+# While this script waits for a socket, NZBGet waits for the script. Keep this
+# short so a busy RPC-API does not turn into a stalled queue.
+#RequestTimeout=10
+
+# Seconds this script may spend in total before it gives up (0 = no limit).
+#
+# Upper bound for how long NZBGet can be blocked by this script, across all
+# requests. When the budget runs out the rest of the queue is left as it is.
+# Keep it well above RequestTimeout: a request is only started while at least a
+# second of the budget is left, so that what remains of it cannot turn into a
+# timeout that looks like NZBGet's fault.
+#TotalTimeout=30
+
 # Queue events to react to (comma separated).
 #
 # Only used when the script runs as a QUEUE script. Possible events:
@@ -129,6 +144,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 
 # NZBGet exit codes for scan scripts.
@@ -150,6 +166,11 @@ DEFAULT_FORCE_PRIORITY = "900"
 DEFAULT_MIN_INTERVAL = "0"
 STATE_FILE_NAME = "PrioritizeNeedles.state"
 DEFAULT_STATE_FILE = "${QueueDir}/" + STATE_FILE_NAME
+
+# Default socket and overall timeouts (keep in sync with the #RequestTimeout
+# and #TotalTimeout defaults documented in the OPTIONS section above).
+DEFAULT_REQUEST_TIMEOUT = "10"
+DEFAULT_TOTAL_TIMEOUT = "30"
 
 
 def log_info(message):
@@ -382,6 +403,92 @@ def name_matches(nzb_name, needles, mode):
     return None
 
 
+def to_int(value, default=0):
+    """Convert a value to int, falling back to default on failure."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# --------------------------------------------------------------------------
+# Time budget
+# --------------------------------------------------------------------------
+#
+# NZBGet waits for this script before it carries on, so every second spent
+# waiting for its RPC-API looks like a hung NZBGet. A busy RPC-API used to block
+# it for a full minute per request - and a failed queue read was followed by a
+# blind write and its legacy-signature retry, a minute each. Every request is
+# capped individually and all of them together, so the worst case is bounded no
+# matter what fails.
+
+_request_timeout = to_int(DEFAULT_REQUEST_TIMEOUT)
+_total_timeout = 0
+_deadline = None
+
+
+class TimeBudgetExceeded(Exception):
+    """Raised when the script has used up its total time budget."""
+
+
+def start_time_budget(request_timeout, total_timeout):
+    """Arm the per-request timeout and the overall deadline."""
+    global _request_timeout, _total_timeout, _deadline
+    _request_timeout = max(1, request_timeout)
+    _total_timeout = max(0, total_timeout)
+    _deadline = time.monotonic() + _total_timeout if _total_timeout > 0 else None
+
+
+# A request needs at least this much of the budget left to stand a chance.
+# Below that the shrinking slice would only buy a "timed out" that blames
+# NZBGet for our own exhausted budget, so TotalTimeout should always be set
+# comfortably above RequestTimeout.
+MIN_REQUEST_SLICE = 1.0
+
+
+def next_timeout():
+    """Timeout for the next request, capped by what is left of the budget."""
+    if _deadline is None:
+        return _request_timeout
+    left = _deadline - time.monotonic()
+    if left < MIN_REQUEST_SLICE:
+        raise TimeBudgetExceeded(
+            "TotalTimeout of %d second(s) is used up" % _total_timeout)
+    return min(_request_timeout, left)
+
+
+def fetch_json(request, what):
+    """Run an HTTP request inside the time budget and decode its JSON answer.
+
+    A timeout that only happened because the budget had cut the request short
+    is reported as the budget running out rather than as NZBGet being slow.
+    """
+    timeout = next_timeout()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError:
+        raise  # an answer, just not the one we wanted - never a budget problem
+    except OSError as exc:
+        if _deadline is not None and time.monotonic() >= _deadline:
+            raise TimeBudgetExceeded(
+                "TotalTimeout of %d second(s) is used up waiting for %s"
+                % (_total_timeout, what)) from exc
+        raise
+
+
+def is_unreachable(exc):
+    """True if the error means NZBGet never answered.
+
+    Timeouts and refused connections are fatal for this run: repeating the call
+    would only block NZBGet twice as long. HTTPError is a URLError, but it means
+    we did get an answer, so it is not counted here.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    return isinstance(exc, (OSError, TimeBudgetExceeded))
+
+
 def rpc_call(method, params):
     """Call an NZBGet JSON-RPC method using the connection info NZBGet passes."""
     host = os.environ.get("NZBOP_CONTROLIP", "127.0.0.1")
@@ -399,27 +506,36 @@ def rpc_call(method, params):
         token = base64.b64encode(("%s:%s" % (username, password)).encode("utf-8")).decode("ascii")
         request.add_header("Authorization", "Basic " + token)
 
-    with urllib.request.urlopen(request, timeout=60) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    payload = fetch_json(request, "NZBGet's RPC method '%s'" % method)
     if payload.get("error"):
         raise RuntimeError(payload["error"])
     return payload.get("result")
 
 
-def to_int(value, default=0):
-    """Convert a value to int, falling back to default on failure."""
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+# Set once we know this NZBGet only accepts the legacy editqueue signature, so
+# the probe below is paid at most once per run.
+_editqueue_legacy = False
 
 
 def editqueue(command, param, ids):
-    """Run editqueue, trying the modern 3-arg signature then the legacy 4-arg one."""
+    """Run editqueue, trying the modern 3-arg signature then the legacy 4-arg one.
+
+    The fallback is only taken when NZBGet actually answered and rejected the
+    call. After a timeout or a refused connection a second attempt would just
+    double the time NZBGet is blocked by this script.
+    """
+    global _editqueue_legacy
+
+    if _editqueue_legacy:
+        return rpc_call("editqueue", [command, 0, str(param), ids])
     try:
         return rpc_call("editqueue", [command, str(param), ids])
-    except Exception:  # noqa: BLE001 - fall back to the older signature
-        return rpc_call("editqueue", [command, 0, str(param), ids])
+    except Exception as exc:  # noqa: BLE001 - maybe just the wrong signature
+        if is_unreachable(exc):
+            raise
+    result = rpc_call("editqueue", [command, 0, str(param), ids])
+    _editqueue_legacy = True
+    return result
 
 
 def get_group_priority(group):
@@ -458,10 +574,17 @@ def target_priority(group, needle, priority, force_below_mb, force_priority):
 
 
 def get_group_by_nzbid(nzbid):
-    """Return the queue group for a specific NZBID, or None."""
+    """Return the queue group for a specific NZBID, or None.
+
+    An unreachable RPC-API is raised instead of reported as None: the caller
+    would otherwise write the priority blindly and block NZBGet for another
+    RequestTimeout on a connection that just failed.
+    """
     try:
         groups = rpc_call("listgroups", [0])
     except Exception as exc:  # noqa: BLE001
+        if is_unreachable(exc):
+            raise
         log_warning("Could not read the queue via RPC: %s" % exc)
         return None
 
@@ -498,6 +621,12 @@ def apply_to_queue(needles, mode, priority, move_to_top, force_below_mb, force_p
             if move_to_top:
                 editqueue("GroupMoveTop", 0, [nzbid])
         except Exception as exc:  # noqa: BLE001
+            if is_unreachable(exc):
+                # Every further entry would block NZBGet for another
+                # RequestTimeout, and none of them can succeed right now.
+                log_warning("NZBGet's RPC-API did not answer while updating '%s' (%s) - "
+                            "leaving the rest of the queue as it is." % (name, exc))
+                break
             log_warning("Could not update queue entry '%s': %s" % (name, exc))
             continue
         count += 1
@@ -599,7 +728,13 @@ def handle_queue(needles, mode, priority, move_to_top, force_below_mb, force_pri
         prioritize_nzbid(name, int(nzbid), needle, priority, move_to_top, force_below_mb,
                          force_priority)
     except Exception as exc:  # noqa: BLE001
-        log_warning("Could not update queue entry '%s': %s" % (name, exc))
+        if is_unreachable(exc):
+            # Not an error: nothing is broken, we just refuse to keep NZBGet
+            # waiting. The next queue event tries again.
+            log_warning("NZBGet's RPC-API did not answer (%s) - leaving '%s' as it is."
+                        % (exc, name))
+        else:
+            log_warning("Could not update queue entry '%s': %s" % (name, exc))
     return SUCCESS
 
 
@@ -608,6 +743,13 @@ def main():
     if "NZBOP_SCRIPTDIR" not in os.environ:
         print("This script is supposed to be called from NZBGet (13.0 or later).")
         return ERROR
+
+    start_time_budget(
+        to_int(get_option("RequestTimeout", DEFAULT_REQUEST_TIMEOUT).strip(),
+               to_int(DEFAULT_REQUEST_TIMEOUT)),
+        to_int(get_option("TotalTimeout", DEFAULT_TOTAL_TIMEOUT).strip(),
+               to_int(DEFAULT_TOTAL_TIMEOUT)),
+    )
 
     needles = parse_needles(get_option("NeedleList"))
     needles.extend(read_needle_file(get_option("NeedleFile").strip()))
