@@ -683,6 +683,17 @@ def series_total_episodes(series):
     return to_int(total, 0)
 
 
+def series_monitored_episodes(series):
+    """Number of monitored episodes of a series (for percentage metrics)."""
+    stats = series.get("statistics") or {}
+    monitored = stats.get("monitoredEpisodeCount")
+    if monitored is None:
+        monitored = stats.get("totalEpisodeCount")
+    if monitored is None:
+        monitored = stats.get("episodeCount", 0)
+    return to_int(monitored, 0)
+
+
 def series_downloaded_episodes(series):
     """Number of episodes of a series Sonarr already has a file for."""
     stats = series.get("statistics") or {}
@@ -843,6 +854,7 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
             "title": title,
             "sortname": sort_title(title, sort_articles),
             "total": series_total_episodes(series),
+            "monitored_total": series_monitored_episodes(series),
             "downloaded": series_downloaded_episodes(series),
             "downloaded_percent": 0.0,
             "year": to_int(series.get("year"), 0),
@@ -871,13 +883,14 @@ def prioritize_target_series(base_url, api_key, exclude_tag, priority, move_to_t
         log_detail("No queued download could be matched to an eligible Sonarr series.")
         return
 
-    # Share of each series' episodes still queued and already downloaded.
-    # Without a known total the series can't be judged and is treated as
+    # Share of each series' monitored episodes still queued and already
+    # downloaded. Without a known monitored total the series can't be judged
+    # and is treated as
     # completely missing (100 % queued, 0 % downloaded).
     for entry in candidates.values():
-        if entry["total"] > 0:
-            entry["remaining_percent"] = min(100.0, 100.0 * entry["remaining_count"] / entry["total"])
-            entry["downloaded_percent"] = min(100.0, 100.0 * entry["downloaded"] / entry["total"])
+        if entry["monitored_total"] > 0:
+            entry["remaining_percent"] = min(100.0, 100.0 * entry["remaining_count"] / entry["monitored_total"])
+            entry["downloaded_percent"] = min(100.0, 100.0 * entry["downloaded"] / entry["monitored_total"])
         else:
             entry["remaining_percent"] = 100.0
             entry["downloaded_percent"] = 0.0
