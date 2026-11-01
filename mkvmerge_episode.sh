@@ -27,6 +27,13 @@
 # Ignore video files smaller than this (MB) - samples, extras, trailers.
 #MinSizeMB=200
 
+# Fail job if previous NZBGet status was not SUCCESS (yes, no).
+#
+# If set to yes, the script tells NZBGet that the job failed (POSTPROCESS_FAILURE)
+# when download, par or unpack had errors, allowing Sonarr/Radarr to trigger
+# an automatic redownload.
+#FailJobOnError=yes
+
 ### NZBGET POST-PROCESSING SCRIPT                                           ###
 ##############################################################################
 
@@ -88,10 +95,22 @@ fi
 # kleinere Dateien gelten als Sample/Extra
 MIN_SIZE_MB=$(num_opt "${NZBPO_MINSIZEMB:-}" 200 MinSizeMB)
 
-# NZBGet: Wenn Download/Unpack nicht erfolgreich war, überspringen
+# yes = Job fehlschlagen lassen (exit 94 / POSTPROCESS_FAILURE), wenn Download/Par/Unpack nicht SUCCESS war.
+# no  = Job überspringen (exit 95 / POSTPROCESS_SKIPPED), Status von NZBGet bleibt unverändert.
+case "$(printf '%s' "${NZBPO_FAILJOBONERROR:-yes}" | tr '[:upper:]' '[:lower:]')" in
+    no|false|0) FAIL_JOB_ON_ERROR="no"  ;;
+    *)          FAIL_JOB_ON_ERROR="yes" ;;
+esac
+
+# NZBGet: Wenn Download/Unpack nicht erfolgreich war, abbrechen oder überspringen
 if [ "$NZBPP_TOTALSTATUS" != "SUCCESS" ]; then
-    echo "[INFO] NZBGet-Status ist nicht SUCCESS. Überspringe."
-    exit 95
+    if [ "$FAIL_JOB_ON_ERROR" = "yes" ]; then
+        echo "[ERROR] NZBGet-Status ist nicht SUCCESS ($NZBPP_TOTALSTATUS). Breche Job mit FAILURE ab."
+        exit 94
+    else
+        echo "[INFO] NZBGet-Status ist nicht SUCCESS ($NZBPP_TOTALSTATUS). Überspringe."
+        exit 95
+    fi
 fi
 
 cd "$TARGET_DIR" || exit 94
