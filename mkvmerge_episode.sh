@@ -3,10 +3,11 @@
 ##############################################################################
 ### NZBGET POST-PROCESSING SCRIPT                                           ###
 
-# Merge multiple video parts for episode and CD-split releases.
+# Merge multiple video parts for episode, movie and CD/part-split releases.
 #
 # This script checks if the NZB name contains an episode tag like E09,
-# or if the release is split into CD parts (cd1/cd2 as file or folder name).
+# or if the release is split into parts (cd1/cd2, part1/part2, disc1/disc2,
+# or -a/-b suffix as file or folder name).
 # If yes, it merges all non-sample video files larger than MinSizeMB.
 #
 # Requires: mkvmerge.
@@ -148,14 +149,14 @@ if [ ${#files[@]} -ge 2 ]; then
     fi
 fi
 
-# 3. Trigger prüfen: Episoden-Tag im Paketnamen ODER CD-Split in Datei-/Ordnernamen
+# 3. Trigger prüfen: Episoden-Tag im Paketnamen ODER CD-/Part-Split in Datei-/Ordnernamen
 reason=""
 if [[ "$FINAL_NAME" =~ E[0-9]{2} ]]; then
     reason="Episoden-Tag erkannt im Paket: $FINAL_NAME"
 else
     for f in "${files[@]}"; do
-        if [[ "$f" =~ (^|[^a-z0-9])cd[0-9]+([^a-z0-9]|$) ]]; then
-            reason="CD-Split erkannt: $f"
+        if [[ "$f" =~ (^|[^a-z0-9])(cd|part|disc|dvd)[0-9]+([^a-z0-9]|$) ]] || [[ "$f" =~ [._-][a-d]\.[a-z0-9]+$ ]]; then
+            reason="Part-/CD-Split erkannt: $f"
             break
         fi
     done
@@ -192,6 +193,6 @@ if [ -n "$reason" ]; then
         exit 95
     fi
 else
-    echo "[INFO] Kein Episoden-Tag (E??) und kein CD-Split gefunden. Vermutlich Staffel-Paket. Überspringe."
+    echo "[INFO] Kein Episoden-Tag (E??) und kein Part-/CD-Split gefunden. Vermutlich Staffel-Paket. Überspringe."
     exit 95
 fi
